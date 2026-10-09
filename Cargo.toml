@@ -1,0 +1,49 @@
+[package]
+name = "screepmanager"
+description = "Uploads built Screeps code (JavaScript, source maps, WebAssembly) to a branch of a Screeps server: the official server, a seasonal server, or a private server."
+edition = "2024"
+version = "0.1.0"
+publish = false
+license = "MIT OR Apache-2.0"
+rust-version = "1.99"
+
+# Keep this list short. Each entry needs a reason that std cannot meet.
+[dependencies]
+# The command line.
+clap = { version = "4", features = ["derive"] }
+# The Screeps API: a blocking HTTP/1.1 client with JSON bodies, and TLS by
+# rustls on the process-wide provider (ring), which `main` installs, so
+# that no C toolchain builds a crypto library.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The configuration file and the bodies of the API.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The binary modules (WebAssembly) of an upload are base64 text.
+base64 = "0.23"
+
+[lints.rust]
+warnings = { level = "deny", priority = -2 }
+unused = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+missing_docs = "deny"
+unsafe_code = "deny"
+
+[lints.clippy]
+allow_attributes = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+
+[lints.rustdoc]
+all = { level = "warn", priority = -1 }
+
+# A panic is a bug: abort without unwinding.
+[profile.release]
+panic = "abort"

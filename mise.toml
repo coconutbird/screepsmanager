@@ -1,0 +1,21 @@
+# mise exports RUSTUP_TOOLCHAIN for its rust tool, which overrides
+# rust-toolchain.toml: pin the same version, so that the rust tool of a
+# parent configuration does not replace it.
+[tools]
+rust = "1.99"
+
+[tasks.fmt]
+description = "Verify the crate is rustfmt-clean"
+run = "cargo fmt --all -- --check"
+
+[tasks.check]
+description = "Clippy gate: pedantic, warnings are errors"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Test suite"
+run = "cargo test"
+
+[tasks.ci]
+description = "Everything CI runs, in order"
+depends = ["fmt", "check", "test"]
