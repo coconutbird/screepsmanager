@@ -1,123 +1,186 @@
-//! The calls of the Screeps API that an upload makes. The paths are under
-//! the base URL of the destination (`https://screeps.com/season/`):
+//! The calls of the Screeps API that an upload makes ([`Endpoint`]). The
+//! paths are under the URL of the server (`https://screeps.com/season/`):
 //!
 //! ```text
 //! POST api/auth/signin             {"email", "password"} -> {"token"}
-//! GET  api/user/branches           -> {"list": [{"branch", ...}, ...]}
+//! GET  api/user/branches           -> {"list": [{"branch", "activeWorld", "activeSim"}, ...]}
 //! POST api/user/clone-branch       {"branch": "", "newName", "defaultModules"}
 //! POST api/user/code               {"branch", "modules"}
 //! POST api/user/set-active-branch  {"branch", "activeName"}
 //! ```
 //!
-//! `modules` maps each module name to its text, or to `{"binary": BASE64}`.
 //! Every call after sign-in sends the token as `X-Token` and `X-Username`;
 //! an answer with an `X-Token` header replaces the token. The server answers
 //! `{"ok": 1, ...}`, or `{"error": "..."}` with status 200 when it refuses.
 
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::{Client as Http, RequestBuilder};
-use reqwest::{StatusCode, Url};
+use reqwest::header::{HeaderValue, InvalidHeaderValue};
+use reqwest::{Method, StatusCode};
 use serde::de::{DeserializeOwned, IgnoredAny};
-use serde::ser::SerializeMap as _;
-use serde::{Deserialize, Serialize, Serializer};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 
-use crate::config::Credentials;
-use crate::modules::Module;
+use crate::branch::{Active, BranchName};
+use crate::config::{Credentials, Sensitive, ServerUrl};
+use crate::modules::Modules;
 
 /// The longest call: an upload of a few megabytes on a slow link.
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// The most bytes of an answer that an error repeats.
 const ERROR_TEXT: usize = 200;
+/// The header of the token.
+const TOKEN: &str = "x-token";
+/// The header that the API also takes the token in.
+const USERNAME: &str = "x-username";
+/// The header of the time when a rate limit resets, in seconds since the
+/// Unix epoch.
+const RATE_LIMIT_RESET: &str = "x-ratelimit-reset";
 
-/// Where a branch runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum Active {
-    /// The world: the shards of the server.
-    World,
-    /// The simulator.
-    Sim,
+/// A call of the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Endpoint {
+    /// Signs in with an email and a password.
+    SignIn,
+    /// Lists the branches of the account.
+    Branches,
+    /// Creates a branch.
+    CloneBranch,
+    /// Replaces the modules of a branch.
+    Code,
+    /// Makes a branch run in the world or the simulator.
+    SetActiveBranch,
 }
 
-impl Active {
-    /// The name, for output.
-    pub(crate) fn as_str(self) -> &'static str {
+impl Endpoint {
+    /// The method of the call.
+    fn method(self) -> Method {
         match self {
-            Self::World => "world",
-            Self::Sim => "sim",
+            Self::Branches => Method::GET,
+            Self::SignIn | Self::CloneBranch | Self::Code | Self::SetActiveBranch => Method::POST,
         }
     }
 
-    /// The `activeName` of `set-active-branch`.
-    fn api_name(self) -> &'static str {
+    /// The path of the call under the URL of the server.
+    fn path(self) -> &'static str {
         match self {
-            Self::World => "activeWorld",
-            Self::Sim => "activeSim",
+            Self::SignIn => "api/auth/signin",
+            Self::Branches => "api/user/branches",
+            Self::CloneBranch => "api/user/clone-branch",
+            Self::Code => "api/user/code",
+            Self::SetActiveBranch => "api/user/set-active-branch",
         }
     }
 }
 
-/// A signed-in client of one server.
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.path())
+    }
+}
+
+/// A branch of the account.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BranchInfo {
+    /// The name, as the server has it.
+    pub(crate) branch: String,
+    /// Whether the branch runs in the world.
+    #[serde(default)]
+    pub(crate) active_world: bool,
+    /// Whether the branch runs in the simulator.
+    #[serde(default)]
+    pub(crate) active_sim: bool,
+}
+
+impl BranchInfo {
+    /// Whether the branch runs in `active`.
+    pub(crate) fn runs_in(&self, active: Active) -> bool {
+        match active {
+            Active::World => self.active_world,
+            Active::Sim => self.active_sim,
+        }
+    }
+}
+
+/// A client of one server, signed in.
 pub(crate) struct Client {
     http: Http,
-    base: Url,
-    token: String,
+    url: ServerUrl,
+    token: HeaderValue,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
-    /// A client of the server at `base`, signed in with `credentials`: a
-    /// token as it is, an email and a password through `api/auth/signin`.
+    /// A client of the server at `url`, signed in with `credentials`: a
+    /// token as it is, an email and a password through [`Endpoint::SignIn`].
     ///
     /// # Errors
     ///
-    /// When the HTTP client does not build or the sign-in fails.
-    pub(crate) fn sign_in(base: Url, credentials: &Credentials) -> Result<Self, String> {
+    /// When the HTTP client does not build, the sign-in fails, or the token
+    /// is not a valid header value.
+    pub(crate) fn sign_in(url: &ServerUrl, credentials: &Credentials<'_>) -> Result<Self, Error> {
+        #[derive(Serialize)]
+        struct SignIn<'a> {
+            email: &'a str,
+            password: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct SignedIn {
+            token: String,
+        }
+
         let http = Http::builder()
             .timeout(TIMEOUT)
-            .user_agent(concat!("screepmanager/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()
-            .map_err(|error| format!("the HTTP client: {error}"))?;
-        let mut client = Self {
-            http,
-            base,
-            token: String::new(),
-        };
-        match credentials {
-            Credentials::Token(token) => client.token.clone_from(token),
+            .map_err(Error::Client)?;
+        let token = match credentials {
+            Credentials::Token(token) => token.clone(),
             Credentials::Password { email, password } => {
-                #[derive(Serialize)]
-                struct SignIn<'a> {
-                    email: &'a str,
-                    password: &'a str,
-                }
-                #[derive(Deserialize)]
-                struct Token {
-                    token: String,
-                }
-                let reply: Token = client.post("api/auth/signin", &SignIn { email, password })?;
-                client.token = reply.token;
+                let body = SignIn {
+                    email,
+                    password: password.expose(),
+                };
+                let request = request(&http, url, Endpoint::SignIn)?.json(&body);
+                let reply: SignedIn = call(Endpoint::SignIn, request)?.0;
+                Sensitive::new(reply.token)
             }
-        }
-        Ok(client)
+        };
+        let mut token = HeaderValue::from_str(token.expose()).map_err(Error::Token)?;
+        token.set_sensitive(true);
+        Ok(Self {
+            http,
+            url: url.clone(),
+            token,
+        })
     }
 
-    /// The names of the branches of the account.
+    /// The branches of the account.
     ///
     /// # Errors
     ///
     /// When the call fails.
-    pub(crate) fn branches(&mut self) -> Result<Vec<String>, String> {
+    pub(crate) fn branches(&mut self) -> Result<Vec<BranchInfo>, Error> {
         #[derive(Deserialize)]
         struct Branches {
-            list: Vec<Branch>,
+            list: Vec<BranchInfo>,
         }
-        #[derive(Deserialize)]
-        struct Branch {
-            branch: String,
-        }
-        let reply: Branches = self.get("api/user/branches")?;
-        Ok(reply.list.into_iter().map(|item| item.branch).collect())
+
+        let reply: Branches = self.call(Endpoint::Branches, None::<&()>)?;
+        Ok(reply.list)
     }
 
     /// Creates the branch `branch` with `modules`.
@@ -126,21 +189,26 @@ impl Client {
     ///
     /// When the call fails, for example when the account has the most
     /// branches that the server allows.
-    pub(crate) fn create_branch(&mut self, branch: &str, modules: &[Module]) -> Result<(), String> {
+    pub(crate) fn create_branch(
+        &mut self,
+        branch: &BranchName,
+        modules: &Modules,
+    ) -> Result<(), Error> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct CloneBranch<'a> {
             branch: &'a str,
-            new_name: &'a str,
-            default_modules: Modules<'a>,
+            new_name: &'a BranchName,
+            default_modules: &'a Modules,
         }
+
         let body = CloneBranch {
             branch: "",
             new_name: branch,
-            default_modules: Modules(modules),
+            default_modules: modules,
         };
-        self.post::<IgnoredAny>("api/user/clone-branch", &body)
-            .map(drop)
+        self.call::<IgnoredAny>(Endpoint::CloneBranch, Some(&body))?;
+        Ok(())
     }
 
     /// Replaces the modules of the branch `branch` with `modules`.
@@ -149,17 +217,15 @@ impl Client {
     ///
     /// When the call fails, for example when the branch does not exist or
     /// the code is above the size limit of the server.
-    pub(crate) fn set_code(&mut self, branch: &str, modules: &[Module]) -> Result<(), String> {
+    pub(crate) fn set_code(&mut self, branch: &BranchName, modules: &Modules) -> Result<(), Error> {
         #[derive(Serialize)]
         struct Code<'a> {
-            branch: &'a str,
-            modules: Modules<'a>,
+            branch: &'a BranchName,
+            modules: &'a Modules,
         }
-        let body = Code {
-            branch,
-            modules: Modules(modules),
-        };
-        self.post::<IgnoredAny>("api/user/code", &body).map(drop)
+
+        self.call::<IgnoredAny>(Endpoint::Code, Some(&Code { branch, modules }))?;
+        Ok(())
     }
 
     /// Makes the branch `branch` the one that runs in `active`.
@@ -167,153 +233,229 @@ impl Client {
     /// # Errors
     ///
     /// When the call fails.
-    pub(crate) fn set_active_branch(&mut self, branch: &str, active: Active) -> Result<(), String> {
+    pub(crate) fn set_active_branch(
+        &mut self,
+        branch: &BranchName,
+        active: Active,
+    ) -> Result<(), Error> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct SetActive<'a> {
-            branch: &'a str,
-            active_name: &'a str,
+        struct SetActiveBranch<'a> {
+            branch: &'a BranchName,
+            active_name: &'static str,
         }
-        let body = SetActive {
+
+        let body = SetActiveBranch {
             branch,
             active_name: active.api_name(),
         };
-        self.post::<IgnoredAny>("api/user/set-active-branch", &body)
-            .map(drop)
+        self.call::<IgnoredAny>(Endpoint::SetActiveBranch, Some(&body))?;
+        Ok(())
     }
 
-    /// The data of a GET of `path`.
-    fn get<T: DeserializeOwned>(&mut self, path: &str) -> Result<T, String> {
-        let url = self.url(path)?;
-        self.send(path, self.http.get(url))
-    }
-
-    /// The data of a POST of `body` to `path`.
-    fn post<T: DeserializeOwned>(
+    /// The data of the call `endpoint` with `body` and the token, which a
+    /// new token of the answer replaces.
+    fn call<T: DeserializeOwned>(
         &mut self,
-        path: &str,
-        body: &impl Serialize,
-    ) -> Result<T, String> {
-        let url = self.url(path)?;
-        self.send(path, self.http.post(url).json(body))
-    }
-
-    /// The URL of the API path `path`.
-    fn url(&self, path: &str) -> Result<Url, String> {
-        self.base
-            .join(path)
-            .map_err(|error| format!("{path}: {error}"))
-    }
-
-    /// Sends `request` to `path` with the token and returns the data of the
-    /// answer (see [`reply`]).
-    fn send<T: DeserializeOwned>(
-        &mut self,
-        path: &str,
-        request: RequestBuilder,
-    ) -> Result<T, String> {
-        let request = if self.token.is_empty() {
-            request
-        } else {
-            request
-                .header("X-Token", &self.token)
-                .header("X-Username", &self.token)
-        };
-        let fail = |error: String| format!("{path}: {error}");
-        let response = request.send().map_err(|error| fail(error.to_string()))?;
-        let header = |name| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .filter(|value| !value.is_empty())
-        };
-        if let Some(token) = header("x-token") {
-            token.clone_into(&mut self.token);
+        endpoint: Endpoint,
+        body: Option<&impl Serialize>,
+    ) -> Result<T, Error> {
+        let mut request = request(&self.http, &self.url, endpoint)?
+            .header(TOKEN, self.token.clone())
+            .header(USERNAME, self.token.clone());
+        if let Some(body) = body {
+            request = request.json(body);
         }
-        let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let reset = header("x-ratelimit-reset")
-                .and_then(|reset| reset.parse::<u64>().ok())
-                .map(|reset| {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |now| now.as_secs());
-                    format!("; the limit resets in {} s", reset.saturating_sub(now))
-                })
-                .unwrap_or_default();
-            return Err(fail(format!("rate limited (status 429){reset}")));
+        let (data, token) = call(endpoint, request)?;
+        if let Some(mut token) = token {
+            token.set_sensitive(true);
+            self.token = token;
         }
-        let text = response.text().map_err(|error| fail(error.to_string()))?;
-        reply(status, &text).map_err(fail)
+        Ok(data)
     }
 }
 
-/// The data of an answer with the status `status` and the body `text`.
-fn reply<T: DeserializeOwned>(status: StatusCode, text: &str) -> Result<T, String> {
-    let value = serde_json::from_str::<Value>(text).ok();
-    if let Some(error) = value
-        .as_ref()
-        .and_then(|value| value.get("error"))
-        .and_then(Value::as_str)
-    {
-        return Err(format!("the server refused: {error}"));
+/// The request of `endpoint` on the server at `url`.
+fn request(http: &Http, url: &ServerUrl, endpoint: Endpoint) -> Result<RequestBuilder, Error> {
+    let url = url
+        .join(endpoint.path())
+        .map_err(|source| Error::Url { endpoint, source })?;
+    Ok(http.request(endpoint.method(), url))
+}
+
+/// Sends `request` of `endpoint`, and returns the data of the answer and
+/// its new token.
+fn call<T: DeserializeOwned>(
+    endpoint: Endpoint,
+    request: RequestBuilder,
+) -> Result<(T, Option<HeaderValue>), Error> {
+    let response = request
+        .send()
+        .map_err(|source| Error::Request { endpoint, source })?;
+    let headers = response.headers();
+    let token = headers
+        .get(TOKEN)
+        .filter(|token| !token.is_empty())
+        .cloned();
+    let status = response.status();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let reset = headers
+            .get(RATE_LIMIT_RESET)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|reset| {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                Duration::from_secs(reset).saturating_sub(now)
+            });
+        return Err(Error::RateLimited { endpoint, reset });
     }
-    if status == StatusCode::UNAUTHORIZED {
-        return Err("not authorized: check the credentials of the destination".to_owned());
+    let text = response
+        .text()
+        .map_err(|source| Error::Request { endpoint, source })?;
+    Ok((reply(endpoint, status, text)?, token))
+}
+
+/// The data of the answer to `endpoint` with the status `status` and the
+/// body `text`.
+fn reply<T: DeserializeOwned>(
+    endpoint: Endpoint,
+    status: StatusCode,
+    text: String,
+) -> Result<T, Error> {
+    /// The fields of every answer.
+    #[derive(Deserialize)]
+    struct Outcome {
+        ok: Option<i64>,
+        error: Option<String>,
     }
-    if !status.is_success() {
-        return Err(format!("status {status}: {}", snippet(text)));
+
+    match serde_json::from_str::<Outcome>(&text).ok() {
+        Some(Outcome {
+            error: Some(message),
+            ..
+        }) => return Err(Error::Refused { endpoint, message }),
+        _ if status == StatusCode::UNAUTHORIZED => return Err(Error::Unauthorized { endpoint }),
+        _ if !status.is_success() => {
+            return Err(Error::Status {
+                endpoint,
+                status,
+                body: snippet(text),
+            });
+        }
+        Some(Outcome { ok: Some(1), .. }) => {}
+        _ => {
+            return Err(Error::NotOk {
+                endpoint,
+                body: snippet(text),
+            });
+        }
     }
-    let Some(value) = value.filter(|value| value.get("ok").and_then(Value::as_i64) == Some(1))
-    else {
-        return Err(format!("the answer is not ok: {}", snippet(text)));
-    };
-    serde_json::from_value(value).map_err(|error| format!("unexpected answer: {error}"))
+    serde_json::from_str(&text).map_err(|source| Error::Answer {
+        endpoint,
+        source,
+        body: snippet(text),
+    })
 }
 
 /// The start of `text`, for an error.
-fn snippet(text: &str) -> &str {
+fn snippet(mut text: String) -> String {
     let mut end = text.len().min(ERROR_TEXT);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    &text[..end]
+    text.truncate(end);
+    text
 }
 
-/// The `modules` of a request: each module name to its text, or to
-/// `{"binary": BASE64}`.
-struct Modules<'a>(&'a [Module]);
+/// The text of the time until a rate limit resets.
+fn reset_text(reset: Option<&Duration>) -> String {
+    reset.map_or_else(String::new, |reset| {
+        format!("; the limit resets in {} s", reset.as_secs())
+    })
+}
 
-impl Serialize for Modules<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Binary<'a> {
-            binary: &'a str,
-        }
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for module in self.0 {
-            if module.kind.is_binary() {
-                map.serialize_entry(
-                    &module.name,
-                    &Binary {
-                        binary: &module.code,
-                    },
-                )?;
-            } else {
-                map.serialize_entry(&module.name, &module.code)?;
-            }
-        }
-        map.end()
-    }
+/// A call that failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    /// The HTTP client does not build.
+    #[error("the HTTP client: {0}")]
+    Client(#[source] reqwest::Error),
+    /// The token is not a valid header value.
+    #[error("the token is not a valid header value")]
+    Token(#[source] InvalidHeaderValue),
+    /// The URL of the call does not parse.
+    #[error("{endpoint}: {source}")]
+    Url {
+        /// The call.
+        endpoint: Endpoint,
+        /// Why the URL does not parse.
+        source: url::ParseError,
+    },
+    /// The request or the answer failed.
+    #[error("{endpoint}: {source}")]
+    Request {
+        /// The call.
+        endpoint: Endpoint,
+        /// What failed.
+        source: reqwest::Error,
+    },
+    /// The server refused the call.
+    #[error("{endpoint}: the server refused: {message}")]
+    Refused {
+        /// The call.
+        endpoint: Endpoint,
+        /// Why the server refused.
+        message: String,
+    },
+    /// The credentials are not valid (status 401).
+    #[error("{endpoint}: not authorized; check the credentials of the server")]
+    Unauthorized {
+        /// The call.
+        endpoint: Endpoint,
+    },
+    /// The account made too many calls (status 429).
+    #[error("{endpoint}: rate limited{}", reset_text(.reset.as_ref()))]
+    RateLimited {
+        /// The call.
+        endpoint: Endpoint,
+        /// The time until the limit resets, when the server says.
+        reset: Option<Duration>,
+    },
+    /// The server answered with an error status.
+    #[error("{endpoint}: status {status}: {body}")]
+    Status {
+        /// The call.
+        endpoint: Endpoint,
+        /// The status.
+        status: StatusCode,
+        /// The start of the answer.
+        body: String,
+    },
+    /// The answer has no `ok: 1`.
+    #[error("{endpoint}: the answer is not ok: {body}")]
+    NotOk {
+        /// The call.
+        endpoint: Endpoint,
+        /// The start of the answer.
+        body: String,
+    },
+    /// The answer does not have the data of the call.
+    #[error("{endpoint}: unexpected answer ({source}): {body}")]
+    Answer {
+        /// The call.
+        endpoint: Endpoint,
+        /// What is missing or wrong.
+        source: serde_json::Error,
+        /// The start of the answer.
+        body: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use crate::modules::Kind;
 
     /// A refusal arrives with status 200; the data needs `ok: 1`; other
     /// statuses are errors with the start of the answer.
@@ -323,45 +465,45 @@ mod tests {
         struct Token {
             token: String,
         }
+
+        let reply = |status, text: &str| reply::<Token>(Endpoint::SignIn, status, text.to_owned());
         assert_eq!(
-            reply(StatusCode::OK, r#"{"ok":1,"token":"t"}"#),
-            Ok(Token {
+            reply(StatusCode::OK, r#"{"ok":1,"token":"t"}"#).ok(),
+            Some(Token {
                 token: "t".to_owned()
             })
         );
-        assert_eq!(
-            reply::<IgnoredAny>(StatusCode::OK, r#"{"error":"branch does not exist"}"#).map(drop),
-            Err("the server refused: branch does not exist".to_owned())
-        );
-        for (status, text) in [
-            (StatusCode::OK, r#"{"token":"t"}"#),
-            (StatusCode::OK, "<html>"),
-            (StatusCode::BAD_GATEWAY, "<html>"),
-            (StatusCode::UNAUTHORIZED, "Unauthorized"),
-        ] {
-            assert!(reply::<Token>(status, text).is_err(), "{status} {text}");
-        }
-        assert_eq!(snippet(&"é".repeat(150)).len(), ERROR_TEXT);
+        assert!(matches!(
+            reply(StatusCode::OK, r#"{"error":"branch does not exist"}"#),
+            Err(Error::Refused { message, .. }) if message == "branch does not exist"
+        ));
+        assert!(matches!(
+            reply(StatusCode::UNAUTHORIZED, "Unauthorized"),
+            Err(Error::Unauthorized { .. })
+        ));
+        assert!(matches!(
+            reply(StatusCode::BAD_GATEWAY, "<html>"),
+            Err(Error::Status { body, .. }) if body == "<html>"
+        ));
+        assert!(matches!(
+            reply(StatusCode::OK, r#"{"token":"t"}"#),
+            Err(Error::NotOk { .. })
+        ));
+        assert!(matches!(
+            reply(StatusCode::OK, r#"{"ok":1}"#),
+            Err(Error::Answer { .. })
+        ));
+        assert_eq!(snippet("é".repeat(150)).len(), ERROR_TEXT);
     }
 
-    /// Text modules are strings; binary modules are `{"binary": ...}`.
+    /// A branch runs where the server says; missing flags are false.
     #[test]
-    fn module_bodies() {
-        let module = |name: &str, kind, code: &str| Module {
-            name: name.to_owned(),
-            kind,
-            code: code.to_owned(),
-            path: PathBuf::new(),
-            len: 0,
-        };
-        let modules = [
-            module("main", Kind::Js, "loop"),
-            module("main.js.map", Kind::SourceMap, "map"),
-            module("main_bg", Kind::Wasm, "AGFzbQ=="),
-        ];
-        assert_eq!(
-            serde_json::to_string(&Modules(&modules)).map_err(|error| error.to_string()),
-            Ok(r#"{"main":"loop","main.js.map":"map","main_bg":{"binary":"AGFzbQ=="}}"#.to_owned())
-        );
+    fn branch_info() {
+        let list: Vec<BranchInfo> = serde_json::from_str(
+            r#"[{"branch":"main","activeWorld":true,"activeSim":false},{"branch":"x"}]"#,
+        )
+        .expect("branches parse");
+        assert!(list[0].runs_in(Active::World) && !list[0].runs_in(Active::Sim));
+        assert!(!list[1].runs_in(Active::World) && !list[1].runs_in(Active::Sim));
     }
 }

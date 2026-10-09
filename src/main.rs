@@ -1,29 +1,39 @@
-//! `screepmanager`: uploads built Screeps code to a branch of a Screeps
-//! server. Run `screepmanager help` for usage.
+//! `screepsmanager`: uploads built Screeps code to the branches of Screeps
+//! servers. Run `screepsmanager help` for usage.
 //!
-//! `upload DIR --target NAME` reads the modules of the build directory DIR
-//! ([`modules`]), takes the destination NAME of the configuration file
-//! ([`config`]), and replaces the code of the destination's branch through
-//! the Screeps API ([`api`]): it creates the branch when the account does
-//! not have it, and with `--activate` makes it the branch that runs.
+//! The configuration ([`config`]) names servers and profiles: a profile is
+//! a server, a branch, and where the branch runs. `upload` reads the
+//! modules of the build directory ([`modules`]) and replaces the code of
+//! the branch of each selected profile through the Screeps API ([`api`]).
 
 mod api;
+mod branch;
 mod config;
 mod modules;
+mod upload;
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command as Process, ExitCode};
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::api::{Active, Client};
-use crate::config::AUTO_BRANCH;
+use crate::config::{Config, ProfileName, ServerName};
 
-/// Uploads built Screeps code to a branch of a Screeps server.
+/// Uploads built Screeps code to the branches of Screeps servers.
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version)]
 struct Cli {
+    /// The configuration file [default: the nearest screepsmanager.toml in
+    /// the working directory or a parent]
+    #[arg(
+        long,
+        short,
+        global = true,
+        env = "SCREEPSMANAGER_CONFIG",
+        value_name = "FILE"
+    )]
+    config: Option<PathBuf>,
     /// The command.
     #[command(subcommand)]
     command: Command,
@@ -32,43 +42,50 @@ struct Cli {
 /// A command.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Upload the modules of a build directory to the branch of a destination.
+    /// Upload the modules of a build directory to the branches of profiles.
     ///
-    /// Each .js file in DIR is a module of its name without .js, each .js.map
-    /// file a source map module of its whole name (a JSON map is wrapped as
-    /// `module.exports = MAP;`), and each .wasm file a binary module of its
-    /// name without .wasm. Other entries are skipped. The upload replaces
-    /// every module of the branch, and creates the branch when it is missing.
-    Upload(Upload),
+    /// Each .js file in the directory is a module of its name without .js,
+    /// each .js.map file a source map module of its whole name (a JSON map
+    /// is wrapped as `module.exports = MAP;`), and each .wasm file a binary
+    /// module of its name without .wasm. Other entries are skipped. The
+    /// upload replaces every module of each branch, and creates a branch
+    /// that the account does not have.
+    Upload(upload::Upload),
+    /// List the profiles of the configuration.
+    Profiles,
 }
 
-/// The arguments of `upload`.
-#[derive(Debug, clap::Args)]
-struct Upload {
-    /// The build directory.
-    dir: PathBuf,
-    /// The destination: a name in the configuration file.
-    #[arg(long, short, value_name = "NAME")]
-    target: String,
-    /// The configuration file.
-    #[arg(
-        long,
-        short,
-        value_name = "FILE",
-        default_value = "screeps.config.json"
-    )]
-    config: PathBuf,
-    /// The branch, instead of the one of the destination; auto is the
-    /// current git branch.
-    #[arg(long, short)]
-    branch: Option<String>,
-    /// Make the branch the one that runs in the world or in the simulator
-    /// (repeatable).
-    #[arg(long, value_enum, value_name = "WHERE")]
-    activate: Vec<Active>,
-    /// Read the modules and the destination, print them, and upload nothing.
-    #[arg(long)]
-    dry_run: bool,
+/// A command that failed.
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    /// The configuration is not available or not valid.
+    #[error(transparent)]
+    Config(#[from] config::Error),
+    /// The build directory does not read as modules.
+    #[error(transparent)]
+    Modules(#[from] modules::Error),
+    /// `auto` names no branch.
+    #[error("branch auto: {0}")]
+    Git(#[from] branch::GitError),
+    /// A secret of a server is not available.
+    #[error("server {server}: {source}")]
+    Secret {
+        /// The server.
+        server: ServerName,
+        /// Why the secret is not available.
+        source: config::SecretError,
+    },
+    /// A call of the API for a profile failed.
+    #[error("profile {profile}: {source}")]
+    Api {
+        /// The profile.
+        profile: ProfileName,
+        /// The call that failed.
+        source: api::Error,
+    },
+    /// The output is not writable.
+    #[error("the output: {0}")]
+    Output(#[from] std::io::Error),
 }
 
 fn main() -> ExitCode {
@@ -76,87 +93,70 @@ fn main() -> ExitCode {
     // reqwest uses the process-wide rustls provider; an error means that
     // one is installed already.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let out = &mut std::io::stdout().lock();
-    let result = match cli.command {
-        Command::Upload(upload) => upload.run(out),
-    };
-    match result {
+    match run(cli, &mut std::io::stdout().lock()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("screepmanager: {error}");
+            eprintln!("{}: {error}", env!("CARGO_PKG_NAME"));
             ExitCode::FAILURE
         }
     }
 }
 
-impl Upload {
-    /// Runs the upload and prints each step to `out`.
-    fn run(self, out: &mut dyn Write) -> Result<(), String> {
-        let destination = config::destination(&self.config, &self.target)?;
-        let branch = match self.branch.as_deref().unwrap_or(&destination.branch) {
-            AUTO_BRANCH => {
-                git_branch().map_err(|error| format!("branch {AUTO_BRANCH}: {error}"))?
-            }
-            branch => branch.to_owned(),
-        };
-        let build = modules::read(&self.dir)?;
-        let mut emit = |text: &str| writeln!(out, "{text}").map_err(|error| error.to_string());
-        emit(&format!(
-            "destination {}: {} branch {branch}",
-            self.target, destination.url
-        ))?;
-        for module in &build.modules {
-            emit(&format!(
-                "module {}: {}, {} bytes ({})",
-                module.name,
-                module.kind.as_str(),
-                module.len,
-                module.path.display()
-            ))?;
-        }
-        for skipped in &build.skipped {
-            emit(&format!(
-                "skipped {}: {}",
-                skipped.path.display(),
-                skipped.reason
-            ))?;
-        }
-        if self.dry_run {
-            return emit("dry run: nothing uploaded");
-        }
-        let mut client = Client::sign_in(destination.url, &destination.credentials)?;
-        if !client.branches()?.contains(&branch) {
-            client.create_branch(&branch, &build.modules)?;
-            emit(&format!("created branch {branch}"))?;
-        }
-        client.set_code(&branch, &build.modules)?;
-        emit(&format!(
-            "uploaded {} modules to branch {branch}",
-            build.modules.len()
-        ))?;
-        for active in self.activate {
-            client.set_active_branch(&branch, active)?;
-            emit(&format!("activated branch {branch} in {}", active.as_str()))?;
-        }
-        Ok(())
+/// Runs the command of `cli` and prints its output to `out`.
+fn run(cli: Cli, out: &mut dyn Write) -> Result<(), Error> {
+    let config = Config::load(cli.config.as_deref())?;
+    writeln!(out, "config {}", config.path.display())?;
+    match cli.command {
+        Command::Upload(upload) => upload.run(&config, out),
+        Command::Profiles => profiles(&config, out),
     }
 }
 
-/// The current branch of the git repository of the working directory.
-fn git_branch() -> Result<String, String> {
-    let output = Process::new("git")
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .output()
-        .map_err(|error| format!("git: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(match stderr.trim() {
-            "" => "HEAD is detached: no current git branch".to_owned(),
-            error => format!("git: {error}"),
-        });
+/// Prints the profiles of `config` as a table.
+fn profiles(config: &Config, out: &mut dyn Write) -> Result<(), Error> {
+    let mut rows =
+        vec![["PROFILE", "SERVER", "URL", "BRANCH", "ACTIVATE", "AUTH"].map(String::from)];
+    for target in config.profiles() {
+        let mark = if config.is_default(target.name) {
+            " *"
+        } else {
+            ""
+        };
+        let activate: Vec<String> = target
+            .profile
+            .activate
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        rows.push([
+            format!("{}{mark}", target.name),
+            target.profile.server.to_string(),
+            target.server.url.to_string(),
+            target.profile.branch.to_string(),
+            if activate.is_empty() {
+                "-".to_owned()
+            } else {
+                activate.join(",")
+            },
+            target.server.auth.to_string(),
+        ]);
     }
-    let mut branch = String::from_utf8(output.stdout)
-        .map_err(|_| "git: the branch name is not UTF-8".to_owned())?;
-    branch.truncate(branch.trim_end().len());
-    Ok(branch)
+    let mut widths = [0; 6];
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    for row in &rows {
+        let last = row.len() - 1;
+        for (at, (cell, width)) in row.iter().zip(widths).enumerate() {
+            if at == last {
+                writeln!(out, "{cell}")?;
+            } else {
+                write!(out, "{cell:<width$}  ")?;
+            }
+        }
+    }
+    writeln!(out, "* the profiles of `upload` without --profile")?;
+    Ok(())
 }

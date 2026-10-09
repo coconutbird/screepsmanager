@@ -1,6 +1,6 @@
 [package]
-name = "screepmanager"
-description = "Uploads built Screeps code (JavaScript, source maps, WebAssembly) to a branch of a Screeps server: the official server, a seasonal server, or a private server."
+name = "screepsmanager"
+description = "Uploads built Screeps code (JavaScript, source maps, WebAssembly) to the branches of Screeps servers through named profiles: the official server, seasonal servers, and private servers."
 edition = "2024"
 version = "0.1.0"
 publish = false
@@ -9,16 +9,23 @@ rust-version = "1.99"
 
 # Keep this list short. Each entry needs a reason that std cannot meet.
 [dependencies]
-# The command line.
-clap = { version = "4", features = ["derive"] }
+# The command line, with defaults from environment variables.
+clap = { version = "4", features = ["derive", "env"] }
 # The Screeps API: a blocking HTTP/1.1 client with JSON bodies, and TLS by
 # rustls on the process-wide provider (ring), which `main` installs, so
 # that no C toolchain builds a crypto library.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-# The configuration file and the bodies of the API.
+# The typed configuration and API bodies.
 serde = { version = "1", features = ["derive"] }
+# The bodies of the API.
 serde_json = "1"
+# The configuration file.
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+# The Display, Error, and From impls of the error enums.
+thiserror = "2"
+# Server URLs and their parse errors (reqwest re-exports `Url` only).
+url = "2"
 # The binary modules (WebAssembly) of an upload are base64 text.
 base64 = "0.23"
 
