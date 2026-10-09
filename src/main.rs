@@ -112,16 +112,17 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<(), Error> {
     }
 }
 
-/// Prints the profiles of `config` as a table.
+/// Prints the profiles of `config` as a table. A `*` marks the profiles of
+/// `upload` without `--profile`; without one, a last line says that `upload`
+/// needs `--profile`.
 fn profiles(config: &Config, out: &mut dyn Write) -> Result<(), Error> {
     let mut rows =
         vec![["PROFILE", "SERVER", "URL", "BRANCH", "ACTIVATE", "AUTH"].map(String::from)];
+    let mut marked = false;
     for target in config.profiles() {
-        let mark = if config.is_default(target.name) {
-            " *"
-        } else {
-            ""
-        };
+        let default = config.is_default(target.name);
+        marked |= default;
+        let mark = if default { " *" } else { "" };
         let activate: Vec<String> = target
             .profile
             .activate
@@ -157,6 +158,49 @@ fn profiles(config: &Config, out: &mut dyn Write) -> Result<(), Error> {
             }
         }
     }
-    writeln!(out, "* the profiles of `upload` without --profile")?;
+    if marked {
+        writeln!(out, "* the profiles of `upload` without --profile")?;
+    } else if rows.len() > 1 {
+        writeln!(
+            out,
+            "no default profile: `upload` needs --profile, or set `default`"
+        )?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server for the configurations of the tests.
+    const SERVER: &str = "[servers.s]\nurl = \"https://screeps.com\"\ntoken = \"t\"\n";
+
+    /// The `profiles` output of the configuration `text`.
+    fn listing(text: &str) -> String {
+        let config =
+            Config::parse(text, PathBuf::from(config::FILE_NAME)).expect("a valid configuration");
+        let mut out = Vec::new();
+        profiles(&config, &mut out).expect("the listing writes");
+        String::from_utf8(out).expect("UTF-8 output")
+    }
+
+    /// The legend of the `*` mark comes only with a marked profile; several
+    /// profiles without `default` say that `upload` needs `--profile`
+    /// instead (issue #1).
+    #[test]
+    fn default_legend() {
+        let two = format!("{SERVER}[profiles.a]\nserver = \"s\"\n[profiles.b]\nserver = \"s\"\n");
+        let unmarked = listing(&two);
+        assert!(!unmarked.contains('*'), "{unmarked}");
+        assert!(unmarked.contains("`upload` needs --profile"), "{unmarked}");
+
+        let with_default = listing(&format!("default = [\"b\"]\n{two}"));
+        assert!(with_default.contains("b *"), "{with_default}");
+        assert!(with_default.ends_with("* the profiles of `upload` without --profile\n"));
+
+        let only = listing(&format!("{SERVER}[profiles.a]\nserver = \"s\"\n"));
+        assert!(only.contains("a *"), "{only}");
+        assert!(only.ends_with("* the profiles of `upload` without --profile\n"));
+    }
 }

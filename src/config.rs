@@ -484,7 +484,11 @@ impl Config {
     }
 
     /// The configuration of the text `text` of the file `path`.
-    fn parse(text: &str, path: PathBuf) -> Result<Self, Error> {
+    ///
+    /// # Errors
+    ///
+    /// When the text is not a valid configuration.
+    pub(crate) fn parse(text: &str, path: PathBuf) -> Result<Self, Error> {
         let file: File = match toml::from_str(text) {
             Ok(file) => file,
             Err(source) => return Err(Error::Parse { path, source }),
