@@ -18,6 +18,17 @@ mise use -g github:coconutbird/screepsmanager          # the latest release, for
 mise use github:coconutbird/screepsmanager@0.1.0       # pinned in this project's mise.toml
 ```
 
+mise holds back releases younger than its `minimum_release_age` (24 hours by
+default), so `latest` reaches a new release a day after it is published. A
+pinned version installs at once, and so does every release of a tool listed
+in `minimum_release_age_excludes`:
+
+```toml
+# ~/.config/mise/config.toml
+[settings]
+minimum_release_age_excludes = ["github:coconutbird/screepsmanager"]
+```
+
 A bot project then pins the tool and its upload next to its build:
 
 ```toml
