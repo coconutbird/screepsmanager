@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  # A manual run also builds the release archives (see `build`): the way to
+  # prove every platform builds without pushing a tag.
+  workflow_dispatch:
+
+# A newer push to the same branch makes the in-flight run obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Every job installs the toolchain of rust-toolchain.toml (`rustup toolchain
+# install` without a name reads it), so CI builds with the pinned compiler.
+# Actions are pinned by commit; the comment names the release.
+jobs:
+  check:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - run: cargo test --locked
+
+  # Release archives. Runs alongside the checks on every `v*` tag push and on
+  # manual runs; it is skipped for branch pushes and pull requests. Each
+  # target builds natively on a runner of its own architecture and uploads
+  # one archive as a workflow artifact. release.yml (a `workflow_run`
+  # consumer) turns those artifacts into the GitHub release once this whole
+  # run is green, so a tag whose checks fail never ships. Asset names carry
+  # the Rust target triple: mise matches on it, do not rename them.
+  build:
+    name: build (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write # sign build-provenance attestations
+      attestations: write # store attestations that mise / `gh attestation` verify
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux builds run on 22.04 so the binaries link against glibc 2.35
+        # and run on any distribution at least that new; the macOS runners
+        # are pinned to one release so a macos-latest bump cannot silently
+        # change what the archives are built against.
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install && rustup target add ${{ matrix.target }}
+
+      - name: Check that the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          crate_version="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p')"
+          if [ "$GITHUB_REF_NAME" != "v${crate_version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match [package].version = ${crate_version} in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        # Archive layout: a single top-level directory holding the binary, the
+        # README, and the licence files. mise strips that directory on
+        # extraction and puts the executable at the root on PATH.
+        run: |
+          version="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p')"
+          name="screepsmanager-v${version}-${TARGET}"
+          exe=""
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+
+          mkdir -p "dist/${name}"
+          cp "target/${TARGET}/release/screepsmanager${exe}" \
+             README.md LICENSE-MIT LICENSE-APACHE \
+             "dist/${name}/"
+
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            archive="${name}.zip"
+            7z a -tzip "${archive}" "${name}" >/dev/null
+          else
+            archive="${name}.tar.gz"
+            tar czf "${archive}" "${name}"
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${archive}" > "${archive}.sha256"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+          rm -r "${name}"
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "archive=dist/${archive}" >> "$GITHUB_OUTPUT"
+
+      # Signed SLSA provenance for the archive, recorded against this repo.
+      # mise checks it through the GitHub attestations API by default when
+      # installing from a release; `gh attestation verify <archive> --repo
+      # coconutbird/screepsmanager` does the same by hand. Tag builds only:
+      # dry runs are not release material.
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+
+      # One artifact per target, named after the archive; release.yml
+      # downloads them by the `screepsmanager-v*` pattern.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error

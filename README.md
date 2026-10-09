@@ -7,6 +7,35 @@ one profile or to several. It reads a build directory that any tool made
 (Rollup, esbuild, `wasm-pack`, ...), so the build needs no plugin and no
 Node.js for the upload.
 
+## Install
+
+With [mise](https://mise.jdx.dev), from the prebuilt binaries of the GitHub
+releases (Linux with glibc 2.35 or newer and macOS, each on x86-64 and arm64;
+Windows on x86-64):
+
+```sh
+mise use -g github:coconutbird/screepsmanager          # the latest release, for every directory
+mise use github:coconutbird/screepsmanager@0.1.0       # pinned in this project's mise.toml
+```
+
+A bot project then pins the tool and its upload next to its build:
+
+```toml
+[tools]
+"github:coconutbird/screepsmanager" = "0.1.0"
+
+[tasks.deploy]
+run = "screepsmanager upload"
+```
+
+mise verifies each download against the digest that GitHub reports and the
+build-provenance attestation of the release workflow. To build from source
+instead (Rust 1.99 or newer):
+
+```sh
+mise use 'cargo:coconutbird/screepsmanager@tag:v0.1.0'
+```
+
 ## Build
 
 ```sh
@@ -14,8 +43,18 @@ cargo build --release   # target/release/screepsmanager
 mise run ci             # fmt, clippy (pedantic, -D warnings), tests
 ```
 
-The toolchain is pinned in `rust-toolchain.toml` (and in `mise.toml`, whose
-`RUSTUP_TOOLCHAIN` would override it).
+The toolchain is pinned in `rust-toolchain.toml`, and in `mise.toml` too:
+mise's rust tool sets `RUSTUP_TOOLCHAIN`, which overrides
+`rust-toolchain.toml`.
+
+### Release
+
+Bump `version` in `Cargo.toml`, run `cargo check` so that `Cargo.lock`
+follows, commit, and push a tag `v<version>`. CI (`.github/workflows/ci.yml`)
+checks the tag against `Cargo.toml`, runs the checks, and builds and attests
+one archive per target; when the whole run is green, `release.yml` publishes
+the release that mise installs from. A tag with a suffix (`v0.2.0-rc1`) is a
+pre-release, which mise's `latest` skips.
 
 ## Usage
 
@@ -41,17 +80,20 @@ Without `--profile` (or `$SCREEPSMANAGER_PROFILE`), `upload` takes the
 server share one sign-in. The first failure stops the upload: its error goes
 to stderr as `screepsmanager: ...` with status 1 (2 for a bad command line).
 
+The first `screepsmanager upload -p main,season` with the configuration below
+prints:
+
 ```text
 config /home/me/bot/screepsmanager.toml
 build /home/me/bot/dist: 3 modules
-  main         js                 39 bytes  main.js
-  main.js.map  source map         37 bytes  main.js.map
+  main         js                 60 bytes  main.js
+  main.js.map  source map         69 bytes  main.js.map
   main_bg      wasm                8 bytes  main_bg.wasm
 profile main: branch main on https://screeps.com/, run in world
+  created branch main
   uploaded 3 modules
-  branch main already runs in world
+  branch main runs in world
 profile season: branch default on https://screeps.com/season/
-  created branch default
   uploaded 3 modules
 ```
 
@@ -124,3 +166,8 @@ A file directly in the build directory is a module when its name ends in
 so that `require("main.js.map")` returns the source map. Every other entry
 is skipped and printed. Two files of one module name are an error, and so
 is a directory without a module: an upload replaces every module of a branch.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
