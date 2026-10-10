@@ -91,10 +91,18 @@ mise's rust tool sets `RUSTUP_TOOLCHAIN`, which overrides
 fmt and clippy on Linux, and the tests (`--locked`) on Linux, Windows, and
 macOS.
 
+Size limits are enforced, not left to review. Clippy denies functions with 200
+or more lines of code (`clippy.toml`, with pedantic Clippy denied in `Cargo.toml`).
+`build.rs` fails every `cargo build`, `check`, `clippy`, and `test` when a Rust
+file under `src/` (or `build.rs`, `tests/`, `benches/`, `examples/`) has 1,000
+physical lines or more, comments, blank lines, and inline tests included. It
+uses only the standard library, so the gate needs no other tool than Cargo.
+
 ### API contract and Rust generation
 
-The manager retains its small blocking client in `src/api.rs`, covering the
-18 operations it uses. The official contract is pinned in `contract/`;
+The manager retains its small blocking client in `src/api/` (`client.rs` makes
+the calls, `transport.rs` sends and decodes them), covering the 18 operations
+it uses. The official contract is pinned in `contract/`;
 [contract/NOTICE](contract/NOTICE) records its revision and update procedure.
 Loopback HTTP tests check outgoing paths, required query/body fields,
 authentication, token rotation, redirect refusal, and mutation retry behavior.
@@ -103,11 +111,11 @@ only the fields the manager needs, retaining private-server compatibility.
 
 Rust generation was evaluated rather than added as an unverified build step:
 
-| Tool evaluated | Blocking issue |
-| --- | --- |
-| Progenitor 0.15.1 | Rejects the contract's OpenAPI 3.1 nullable type arrays; its client transport is asynchronous. |
-| OpenAPI Generator Rust, 7.27.0-SNAPSHOT | Generates success/error unions with a required `error` field on successful responses, and discards headers needed for token rotation. |
-| Typify 0.8.0 | Generates models, not a client; full official response models reject standalone adaptations, and upload models own their payloads instead of borrowing them. |
+| Tool evaluated                          | Blocking issue                                                                                                                                               |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Progenitor 0.15.1                       | Rejects the contract's OpenAPI 3.1 nullable type arrays; its client transport is asynchronous.                                                               |
+| OpenAPI Generator Rust, 7.27.0-SNAPSHOT | Generates success/error unions with a required `error` field on successful responses, and discards headers needed for token rotation.                        |
+| Typify 0.8.0                            | Generates models, not a client; full official response models reject standalone adaptations, and upload models own their payloads instead of borrowing them. |
 
 No Rust code is generated and no generator is needed to build or run the tool.
 The maintained transport avoids copying upload modules. Existing compatibility
@@ -219,22 +227,22 @@ selector = ["node", "scripts/select-spawn.mjs"]
 shard = "auto"
 ```
 
-| Key                     | Meaning                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------- |
-| `dir`                   | Build directory, relative to the file. Default `dist`                               |
-| `default`               | Profiles of `upload` without `--profile`. Default: the only profile                 |
-| `servers.NAME.url`      | URL that the API is under: `http` or `https`; `/season` for the seasonal server     |
-| `servers.NAME.token`    | API token (official server: account settings, auth tokens)                          |
-| `servers.NAME.email`    | Account email, with `password`, for a private server with screepsmod-auth           |
-| `servers.NAME.password` | Account password                                                                    |
-| `profiles.NAME.server`  | Server of the profile                                                               |
-| `profiles.NAME.branch`  | Branch to upload to; `auto` is the current git branch. Default `default`            |
-| `profiles.NAME.activate`| Where the upload makes the branch run: `world`, `sim`. Default: nowhere             |
-| `profiles.NAME.spawn.selector`  | Program and arguments of the spawn selector (no shell), run next to the file |
-| `profiles.NAME.spawn.shard`     | `auto` (the one shard with CPU), a shard name, or unset on a server without shards |
-| `profiles.NAME.spawn.interval`  | Seconds between polls, 60 to 86400. Default 60                             |
-| `profiles.NAME.spawn.radius`    | Rooms around the start room that candidates come from, 1 to 10. Default 5 |
-| `profiles.NAME.spawn.candidates`| Most rooms that the selector chooses from, 1 to 64. Default 16             |
+| Key                              | Meaning                                                                            |
+| -------------------------------- | ---------------------------------------------------------------------------------- |
+| `dir`                            | Build directory, relative to the file. Default `dist`                              |
+| `default`                        | Profiles of `upload` without `--profile`. Default: the only profile                |
+| `servers.NAME.url`               | URL that the API is under: `http` or `https`; `/season` for the seasonal server    |
+| `servers.NAME.token`             | API token (official server: account settings, auth tokens)                         |
+| `servers.NAME.email`             | Account email, with `password`, for a private server with screepsmod-auth          |
+| `servers.NAME.password`          | Account password                                                                   |
+| `profiles.NAME.server`           | Server of the profile                                                              |
+| `profiles.NAME.branch`           | Branch to upload to; `auto` is the current git branch. Default `default`           |
+| `profiles.NAME.activate`         | Where the upload makes the branch run: `world`, `sim`. Default: nowhere            |
+| `profiles.NAME.spawn.selector`   | Program and arguments of the spawn selector (no shell), run next to the file       |
+| `profiles.NAME.spawn.shard`      | `auto` (the one shard with CPU), a shard name, or unset on a server without shards |
+| `profiles.NAME.spawn.interval`   | Seconds between polls, 60 to 86400. Default 60                                     |
+| `profiles.NAME.spawn.radius`     | Rooms around the start room that candidates come from, 1 to 10. Default 5          |
+| `profiles.NAME.spawn.candidates` | Most rooms that the selector chooses from, 1 to 64. Default 16                     |
 
 A server signs in with `token`, or with `email` and `password`. A secret is a
 string, or `{ env = "VARIABLE" }` to read it from the environment (or the
@@ -296,7 +304,18 @@ follows no redirect, so the token goes to the configured server only.
 stdin, one JSON record:
 
 ```json
-{"version": 1, "shard": "shard3", "rooms": [{"name": "W1N1", "terrain": "<2500 digits 0..3, row by row>", "objects": [], "status": {}}]}
+{
+  "version": 1,
+  "shard": "shard3",
+  "rooms": [
+    {
+      "name": "W1N1",
+      "terrain": "<2500 digits 0..3, row by row>",
+      "objects": [],
+      "status": {}
+    }
+  ]
+}
 ```
 
 `shard` is `null` without shards; `objects` and `status` are as the server's
@@ -317,8 +336,16 @@ failure, a timeout, or an answer against the protocol is an error.
 proof from the bot. The bot writes every tick
 
 ```js
-Memory.__screepsmanager = { version: 1, tick: Game.time, shard: Game.shard.name,
-  rooms: 0, creeps: 0, spawns: 0, sites: 0, powerCreeps: 0 };
+Memory.__screepsmanager = {
+  version: 1,
+  tick: Game.time,
+  shard: Game.shard.name,
+  rooms: 0,
+  creeps: 0,
+  spawns: 0,
+  sites: 0,
+  powerCreeps: 0,
+};
 ```
 
 with its owned controllers, creeps, spawns, construction sites, and power

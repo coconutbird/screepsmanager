@@ -37,10 +37,11 @@
 //! credentials of an account on it: `token`, or `email` and `password` for
 //! a private server with password sign-in (screepsmod-auth). A secret is a
 //! string, or `{ env = "VARIABLE" }` to read it from the environment, or
-//! else from the `--env-file` ([`EnvFile`]), when a command needs it. A
-//! profile is a server, a branch (`default` when not set; `auto` is the
-//! current git branch), and where the upload makes the branch run
-//! (`world`, `sim`). A key that the format does not have is an error.
+//! else from the `--env-file` ([`EnvFile`](crate::envfile::EnvFile)), when
+//! a command needs it. A profile is a server, a branch (`default` when not
+//! set; `auto` is the current git branch), and where the upload makes the
+//! branch run (`world`, `sim`). A key that the format does not have is an
+//! error.
 //!
 //! A profile with a spawn table is one that `poll` keeps a spawn of:
 //!
@@ -52,399 +53,34 @@
 //! radius = 5          # rooms around the start room that candidates come from (1..=10)
 //! candidates = 16     # the most rooms that the selector chooses from (1..=64)
 //! ```
+//!
+//! [`name`] checks the names, [`secret`] holds and resolves the secrets,
+//! [`server`] the URLs and the sign-in of the servers, and [`spawn`] the
+//! spawn tables; this module ties profiles to servers and selects them.
+
+mod name;
+mod secret;
+mod server;
+mod spawn;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::time::Duration;
 
-use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
-use url::Url;
+use serde::Deserialize;
+
+pub(crate) use name::{ProfileName, ServerName};
+pub(crate) use secret::{SecretError, Sensitive};
+pub(crate) use server::{Credentials, Server, ServerUrl};
+pub(crate) use spawn::{ShardChoice, Spawn};
 
 use crate::branch::{Active, Branch};
-use crate::envfile::EnvFile;
 
 /// The name of the configuration file that `upload` and `profiles` look
 /// for in the working directory and its parents.
 pub(crate) const FILE_NAME: &str = "screepsmanager.toml";
 /// The build directory when the configuration names none.
 const DEFAULT_DIR: &str = "dist";
-
-/// Defines a name type: letters, digits, `-`, `_`, and `.`.
-macro_rules! name {
-    ($(#[$doc:meta])* $name:ident, $what:literal) => {
-        $(#[$doc])*
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
-        #[serde(try_from = "String")]
-        pub(crate) struct $name(String);
-
-        impl TryFrom<String> for $name {
-            type Error = InvalidName;
-
-            fn try_from(name: String) -> Result<Self, InvalidName> {
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
-                {
-                    Ok(Self(name))
-                } else {
-                    Err(InvalidName { what: $what, name })
-                }
-            }
-        }
-
-        impl FromStr for $name {
-            type Err = InvalidName;
-
-            fn from_str(name: &str) -> Result<Self, InvalidName> {
-                Self::try_from(name.to_owned())
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.pad(&self.0)
-            }
-        }
-    };
-}
-
-name!(
-    /// The name of a server of the configuration.
-    ServerName,
-    "server"
-);
-name!(
-    /// The name of a profile of the configuration.
-    ProfileName,
-    "profile"
-);
-name!(
-    /// The name of a shard of a server (`shard3`).
-    ShardName,
-    "shard"
-);
-
-impl ShardName {
-    /// The name as the API takes it.
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A server or profile name with other characters than letters, digits,
-/// `-`, `_`, and `.`.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{what} {name:?}: a name has letters, digits, `-`, `_`, and `.`")]
-pub(crate) struct InvalidName {
-    what: &'static str,
-    name: String,
-}
-
-/// The URL of a server: `http` or `https`, without a query or a fragment,
-/// with a final `/` so that the API paths join under it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
-pub(crate) struct ServerUrl(Url);
-
-impl ServerUrl {
-    /// The URL of the API path `path` (`api/user/code`).
-    ///
-    /// # Errors
-    ///
-    /// When the joined URL does not parse.
-    pub(crate) fn join(&self, path: &str) -> Result<Url, url::ParseError> {
-        self.0.join(path)
-    }
-}
-
-impl TryFrom<String> for ServerUrl {
-    type Error = InvalidUrl;
-
-    fn try_from(text: String) -> Result<Self, InvalidUrl> {
-        let mut url = match Url::parse(&text) {
-            Ok(url) => url,
-            Err(source) => return Err(InvalidUrl::Parse { url: text, source }),
-        };
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(InvalidUrl::Scheme { url: text });
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(InvalidUrl::Query { url: text });
-        }
-        if !url.path().ends_with('/') {
-            let path = format!("{}/", url.path());
-            url.set_path(&path);
-        }
-        Ok(Self(url))
-    }
-}
-
-impl fmt::Display for ServerUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-/// A server URL that is not valid.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum InvalidUrl {
-    /// It does not parse.
-    #[error("url {url:?}: {source}")]
-    Parse {
-        /// The URL.
-        url: String,
-        /// Why it does not parse.
-        source: url::ParseError,
-    },
-    /// Its scheme is not `http` or `https`.
-    #[error("url {url:?}: use http or https")]
-    Scheme {
-        /// The URL.
-        url: String,
-    },
-    /// It has a query or a fragment.
-    #[error("url {url:?}: a server URL has no query and no fragment")]
-    Query {
-        /// The URL.
-        url: String,
-    },
-}
-
-/// A secret value. Its debug output does not show it.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct Sensitive(String);
-
-impl Sensitive {
-    /// The secret `value`.
-    pub(crate) fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    /// The value.
-    pub(crate) fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Sensitive {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Sensitive(..)")
-    }
-}
-
-/// A secret of a server: written in the file, or read from an environment
-/// variable when an upload needs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Secret {
-    /// The value, from the file.
-    Value(Sensitive),
-    /// The environment variable of the value.
-    Env(String),
-}
-
-impl Secret {
-    /// The value of the secret: a variable comes from the process
-    /// environment, or else from the `--env-file` variables `env`.
-    ///
-    /// # Errors
-    ///
-    /// When the environment variable is not set, not Unicode, or empty.
-    pub(crate) fn resolve(&self, env: &EnvFile) -> Result<Sensitive, SecretError> {
-        self.resolve_with(env, &|name: &str| std::env::var(name))
-    }
-
-    /// The value of the secret, with `process` for the process environment.
-    fn resolve_with(
-        &self,
-        env: &EnvFile,
-        process: &dyn Fn(&str) -> Result<String, std::env::VarError>,
-    ) -> Result<Sensitive, SecretError> {
-        match self {
-            Self::Value(value) => Ok(value.clone()),
-            Self::Env(variable) => match env.var(variable, process) {
-                Ok(Some(value)) if value.expose().is_empty() => {
-                    Err(SecretError::Empty(variable.clone()))
-                }
-                Ok(Some(value)) => Ok(value),
-                Ok(None) => Err(SecretError::NotSet(variable.clone())),
-                Err(_) => Err(SecretError::NotUnicode(variable.clone())),
-            },
-        }
-    }
-}
-
-impl fmt::Display for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Value(_) => f.write_str("in the file"),
-            Self::Env(variable) => write!(f, "from ${variable}"),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Secret {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        /// The table form of a secret.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct FromEnv {
-            env: String,
-        }
-
-        /// Reads a string or a `{ env = "VARIABLE" }` table.
-        struct SecretVisitor;
-
-        impl<'de> Visitor<'de> for SecretVisitor {
-            type Value = Secret;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a string, or a table { env = \"VARIABLE\" }")
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Secret, E> {
-                if value.is_empty() {
-                    return Err(E::custom("a secret is not empty"));
-                }
-                Ok(Secret::Value(Sensitive(value.to_owned())))
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Secret, A::Error> {
-                let FromEnv { env } =
-                    FromEnv::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                if env.is_empty() {
-                    return Err(de::Error::custom(
-                        "an environment variable name is not empty",
-                    ));
-                }
-                Ok(Secret::Env(env))
-            }
-        }
-
-        deserializer.deserialize_any(SecretVisitor)
-    }
-}
-
-/// A secret that is not available.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum SecretError {
-    /// The variable is not set, in the environment or the env file.
-    #[error("${0} is not set (in the environment or --env-file)")]
-    NotSet(String),
-    /// The value of the variable is not Unicode.
-    #[error("${0} is not Unicode")]
-    NotUnicode(String),
-    /// The value of the variable is empty.
-    #[error("${0} is empty")]
-    Empty(String),
-}
-
-/// How a server signs in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Auth {
-    /// An API token (official server: account settings, auth tokens).
-    Token(Secret),
-    /// The email and the password of the account (screepsmod-auth).
-    Password {
-        /// The email of the account.
-        email: String,
-        /// The password of the account.
-        password: Secret,
-    },
-}
-
-impl Auth {
-    /// The credentials, with the secret read from the file, the
-    /// environment, or the `--env-file` variables `env`.
-    ///
-    /// # Errors
-    ///
-    /// When the secret is not available.
-    pub(crate) fn resolve(&self, env: &EnvFile) -> Result<Credentials<'_>, SecretError> {
-        Ok(match self {
-            Self::Token(token) => Credentials::Token(token.resolve(env)?),
-            Self::Password { email, password } => Credentials::Password {
-                email,
-                password: password.resolve(env)?,
-            },
-        })
-    }
-}
-
-impl fmt::Display for Auth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Token(token) => write!(f, "token {token}"),
-            Self::Password { email, password } => write!(f, "{email}, password {password}"),
-        }
-    }
-}
-
-/// The credentials of a server, with the secret read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Credentials<'a> {
-    /// An API token.
-    Token(Sensitive),
-    /// The email and the password of the account.
-    Password {
-        /// The email of the account.
-        email: &'a str,
-        /// The password of the account.
-        password: Sensitive,
-    },
-}
-
-/// A server: the URL of its API and how to sign in.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "ServerFile")]
-pub(crate) struct Server {
-    /// The URL that the API is under.
-    pub(crate) url: ServerUrl,
-    /// How to sign in.
-    pub(crate) auth: Auth,
-}
-
-/// A server as the file writes it.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ServerFile {
-    url: ServerUrl,
-    token: Option<Secret>,
-    email: Option<String>,
-    password: Option<Secret>,
-}
-
-impl TryFrom<ServerFile> for Server {
-    type Error = AuthError;
-
-    fn try_from(file: ServerFile) -> Result<Self, AuthError> {
-        let auth = match (file.token, file.email, file.password) {
-            (Some(token), None, None) => Auth::Token(token),
-            (None, Some(email), Some(password)) => Auth::Password { email, password },
-            (Some(_), _, _) => return Err(AuthError::Both),
-            (None, _, _) => return Err(AuthError::Missing),
-        };
-        Ok(Self {
-            url: file.url,
-            auth,
-        })
-    }
-}
-
-/// A server without one way to sign in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum AuthError {
-    /// Neither a token nor an email and a password.
-    #[error("set `token`, or `email` and `password`")]
-    Missing,
-    /// A token and an email or a password.
-    #[error("set `token`, or `email` and `password`, not both")]
-    Both,
-}
 
 /// A profile: a server, a branch, where the upload makes it run, and how
 /// `poll` keeps a spawn in the world.
@@ -462,146 +98,6 @@ pub(crate) struct Profile {
     /// How `poll` places the spawn of the account; `poll` skips a profile
     /// without it.
     pub(crate) spawn: Option<Spawn>,
-}
-
-/// The shard of a spawn: `auto`, the one shard with CPU, or a name.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
-pub(crate) enum ShardChoice {
-    /// The only shard where the account has CPU.
-    Auto,
-    /// The shard of this name.
-    Named(ShardName),
-}
-
-impl TryFrom<String> for ShardChoice {
-    type Error = InvalidName;
-
-    fn try_from(name: String) -> Result<Self, InvalidName> {
-        if name == "auto" {
-            Ok(Self::Auto)
-        } else {
-            ShardName::try_from(name).map(Self::Named)
-        }
-    }
-}
-
-impl fmt::Display for ShardChoice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Auto => f.pad("auto"),
-            Self::Named(name) => name.fmt(f),
-        }
-    }
-}
-
-/// How `poll` places the spawn of a profile's account.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "SpawnFile")]
-pub(crate) struct Spawn {
-    /// The program and arguments of the selector (no shell), which runs in
-    /// the directory of the configuration file.
-    pub(crate) selector: Vec<String>,
-    /// The shard; none on a private server without shards.
-    pub(crate) shard: Option<ShardChoice>,
-    /// The time between two polls.
-    pub(crate) interval: Duration,
-    /// How many rooms around the start room of the server, in each
-    /// direction, the candidates come from.
-    pub(crate) radius: u32,
-    /// The most candidate rooms that the selector chooses from.
-    pub(crate) candidates: usize,
-}
-
-impl Spawn {
-    /// The bounds of `interval`, in seconds: the official server allows
-    /// one Memory read a minute.
-    pub(crate) const INTERVAL: RangeInclusive<u64> = 60..=86_400;
-    /// The bounds of `radius`.
-    pub(crate) const RADIUS: RangeInclusive<u64> = 1..=10;
-    /// The bounds of `candidates`.
-    pub(crate) const CANDIDATES: RangeInclusive<u64> = 1..=64;
-    /// The default of `interval`, in seconds.
-    const DEFAULT_INTERVAL: u64 = 60;
-    /// The default of `radius`.
-    const DEFAULT_RADIUS: u64 = 5;
-    /// The default of `candidates`.
-    const DEFAULT_CANDIDATES: u64 = 16;
-}
-
-/// A spawn table as the file writes it.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpawnFile {
-    selector: Vec<String>,
-    shard: Option<ShardChoice>,
-    interval: Option<u64>,
-    radius: Option<u64>,
-    candidates: Option<u64>,
-}
-
-impl TryFrom<SpawnFile> for Spawn {
-    type Error = SpawnError;
-
-    fn try_from(file: SpawnFile) -> Result<Self, SpawnError> {
-        if file.selector.first().is_none_or(String::is_empty) {
-            return Err(SpawnError::Selector);
-        }
-        let bounded = |key, value: Option<u64>, default, range: RangeInclusive<u64>| {
-            let value = value.unwrap_or(default);
-            if range.contains(&value) {
-                Ok(value)
-            } else {
-                Err(SpawnError::Range { key, value, range })
-            }
-        };
-        let interval = bounded(
-            "interval",
-            file.interval,
-            Self::DEFAULT_INTERVAL,
-            Self::INTERVAL,
-        )?;
-        let radius = bounded("radius", file.radius, Self::DEFAULT_RADIUS, Self::RADIUS)?;
-        let candidates = bounded(
-            "candidates",
-            file.candidates,
-            Self::DEFAULT_CANDIDATES,
-            Self::CANDIDATES,
-        )?;
-        Ok(Self {
-            selector: file.selector,
-            shard: file.shard,
-            interval: Duration::from_secs(interval),
-            radius: u32::try_from(radius).map_err(|_| SpawnError::Range {
-                key: "radius",
-                value: radius,
-                range: Self::RADIUS,
-            })?,
-            candidates: usize::try_from(candidates).map_err(|_| SpawnError::Range {
-                key: "candidates",
-                value: candidates,
-                range: Self::CANDIDATES,
-            })?,
-        })
-    }
-}
-
-/// A spawn table that is not valid.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum SpawnError {
-    /// The selector has no program.
-    #[error("`selector` is the program and its arguments, the program not empty")]
-    Selector,
-    /// A number is out of its bounds.
-    #[error("`{key}` = {value}: use {}..={}", .range.start(), .range.end())]
-    Range {
-        /// The key.
-        key: &'static str,
-        /// The value.
-        value: u64,
-        /// The bounds.
-        range: RangeInclusive<u64>,
-    },
 }
 
 /// The configuration as the file writes it.
@@ -968,6 +464,10 @@ pub(crate) enum Error {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::secret::Secret;
+    use super::server::Auth;
     use super::*;
 
     /// A server and one profile without a spawn table.
@@ -1234,34 +734,5 @@ mod tests {
             let error = Config::parse(&text, PathBuf::from(FILE_NAME)).expect_err(&text);
             assert!(error.to_string().contains(expected), "{text}\n{error}");
         }
-    }
-
-    /// A secret variable comes from the process, or else from the env
-    /// file; empty and missing values are errors that name the variable.
-    #[test]
-    fn secrets() {
-        let file = EnvFile::of(&[("FILE", "from-file"), ("BOTH", "from-file")]);
-        let process = |name: &str| match name {
-            "BOTH" => Ok("from-process".to_owned()),
-            "EMPTY" => Ok(String::new()),
-            _ => Err(std::env::VarError::NotPresent),
-        };
-        let resolve = |name: &str| {
-            Secret::Env(name.to_owned())
-                .resolve_with(&file, &process)
-                .map(|value| value.expose().to_owned())
-        };
-        assert_eq!(resolve("FILE").as_deref(), Ok("from-file"));
-        assert_eq!(resolve("BOTH").as_deref(), Ok("from-process"));
-        assert_eq!(
-            resolve("EMPTY"),
-            Err(SecretError::Empty("EMPTY".to_owned()))
-        );
-        assert_eq!(resolve("NONE"), Err(SecretError::NotSet("NONE".to_owned())));
-        let value = Secret::Value(Sensitive::new("v".to_owned()));
-        assert_eq!(
-            value.resolve_with(&EnvFile::default(), &process),
-            Ok(Sensitive::new("v".to_owned()))
-        );
     }
 }

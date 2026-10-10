@@ -9,12 +9,12 @@ description = "Verify the crate is rustfmt-clean"
 run = "cargo fmt --all -- --check"
 
 [tasks.check]
-description = "Clippy gate: pedantic, warnings are errors"
-run = "cargo clippy --all-targets -- -D warnings"
+description = "Clippy gate: pedantic, warnings are errors; build.rs checks file sizes"
+run = "cargo clippy --locked --all-targets -- -D warnings"
 
 [tasks.test]
 description = "Test suite"
-run = "cargo test"
+run = "cargo test --locked"
 
 [tasks.ci]
 description = "Everything CI runs, in order"

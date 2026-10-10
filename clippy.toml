@@ -1,2 +1,2 @@
 # Keep each function below 200 lines.
-too-many-lines-threshold = 200
+too-many-lines-threshold = 199

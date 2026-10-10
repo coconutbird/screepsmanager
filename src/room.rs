@@ -3,7 +3,6 @@
 //! are the manager's own: the selector chooses, these decide whether the
 //! choice may be placed.
 
-use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 
@@ -65,15 +64,9 @@ impl RoomName {
                 }
             }
         }
-        rooms.sort_by(|a, b| self.order(*a, *b));
+        // Each name is formatted once, not twice per comparison.
+        rooms.sort_by_cached_key(|room| (self.distance(*room), room.to_string()));
         rooms
-    }
-
-    /// Nearest to `self` first, then by name.
-    fn order(self, a: Self, b: Self) -> Ordering {
-        self.distance(a)
-            .cmp(&self.distance(b))
-            .then_with(|| a.to_string().cmp(&b.to_string()))
     }
 }
 

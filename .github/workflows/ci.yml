@@ -22,7 +22,9 @@ env:
 
 # Every job installs the toolchain of rust-toolchain.toml (`rustup toolchain
 # install` without a name reads it), so CI builds with the pinned compiler.
-# Actions are pinned by commit; the comment names the release.
+# Actions are pinned by commit; the comment names the release. Every cargo
+# command but fmt also runs build.rs, which fails on a Rust file of 1,000
+# lines or more; Clippy denies a function of more than 200 lines of code.
 jobs:
   check:
     name: fmt and clippy

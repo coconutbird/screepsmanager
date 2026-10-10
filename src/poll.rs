@@ -24,12 +24,14 @@
 //! account with CPU on one shard of several is never reset automatically.
 //! That is the price of the proof: a reset never rests on a guess.
 
+mod clock;
+
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
@@ -41,13 +43,10 @@ use crate::envfile::EnvFile;
 use crate::heartbeat::{self, Heartbeat};
 use crate::room::{self, InvalidTerrain, RoomName, Terrain, Unfit};
 use crate::selector::{self, Candidate, Choice};
+use clock::{cooldown, now_ms, utc};
 
 /// How long a `lost` account without footholds must stay so before a reset.
 const CONFIRM: Duration = Duration::from_secs(180);
-/// How long after a respawn the server refuses a spawn.
-const RESPAWN_COOLDOWN: Duration = Duration::from_secs(180);
-/// A margin on the cooldown, for the clocks of the server and this host.
-const COOLDOWN_MARGIN: Duration = Duration::from_secs(10);
 /// How long a plan that placed no spawn (read-only, no candidate, refused,
 /// blocked) stands before the next poll reads the candidates again: the
 /// server limits `map-stats` to one call a minute.
@@ -768,23 +767,6 @@ fn cpu(me: &Me, shard: Option<&str>) -> f64 {
     }
 }
 
-/// How long until the server takes a spawn after the respawn of the
-/// account at `server` (milliseconds since the Unix epoch) or of this
-/// process at `local`, at `now`; none when it takes one.
-fn cooldown(server: Option<f64>, local: Option<SystemTime>, now: SystemTime) -> Option<Duration> {
-    let wait = RESPAWN_COOLDOWN + COOLDOWN_MARGIN;
-    let server = server
-        .filter(|ms| ms.is_finite() && *ms > 0.0)
-        .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
-        .map(|since| UNIX_EPOCH + since + wait);
-    let local = local.map(|at| at + wait);
-    let until = server.max(local)?;
-    until
-        .duration_since(now)
-        .ok()
-        .filter(|left| !left.is_zero())
-}
-
 /// The key of `room` on `shard` in the caches.
 fn key(shard: Option<&str>, room: &str) -> String {
     format!("{}/{room}", shard.unwrap_or(""))
@@ -793,48 +775,6 @@ fn key(shard: Option<&str>, room: &str) -> String {
 /// The name of `shard` for output.
 fn label(shard: Option<&str>) -> &str {
     shard.unwrap_or("the world")
-}
-
-/// The time, in milliseconds since the Unix epoch.
-fn now_ms() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |since| since.as_secs_f64() * 1000.0)
-}
-
-/// `time` in UTC: `2026-10-10T12:00:00Z`.
-fn utc(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    let (days, rest) = (seconds / 86_400, seconds % 86_400);
-    let (year, month, day) = civil(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60
-    )
-}
-
-/// The year, month, and day of `days` since 1970-01-01 (Howard Hinnant's
-/// `civil_from_days`).
-fn civil(days: u64) -> (u64, u64, u64) {
-    let shifted = days + 719_468;
-    let era = shifted / 146_097;
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + u64::from(month <= 2);
-    (year, month, day)
 }
 
 /// A poll of a profile that failed.
@@ -897,43 +837,6 @@ pub(crate) enum Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Dates in UTC.
-    #[test]
-    fn dates() {
-        assert_eq!(utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
-        assert_eq!(
-            utc(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
-            "2023-11-14T22:13:20Z"
-        );
-        assert_eq!(
-            utc(UNIX_EPOCH + Duration::from_hours(264_384)),
-            "2000-02-29T00:00:00Z"
-        );
-    }
-
-    /// The cooldown runs from the later respawn, server or local, with a
-    /// margin.
-    #[test]
-    fn cooldowns() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let ms = |seconds: u32| Some(f64::from(seconds) * 1000.0);
-        assert_eq!(cooldown(None, None, now), None);
-        assert_eq!(cooldown(ms(1_000_000 - 500), None, now), None);
-        assert_eq!(
-            cooldown(ms(1_000_000 - 100), None, now),
-            Some(Duration::from_secs(90))
-        );
-        assert_eq!(
-            cooldown(
-                ms(1_000_000 - 100),
-                Some(now - Duration::from_secs(10)),
-                now
-            ),
-            Some(Duration::from_secs(180))
-        );
-        assert_eq!(cooldown(Some(f64::NAN), None, now), None);
-    }
 
     /// The confirmation counts while the same shards stay lost, and starts
     /// over for others.

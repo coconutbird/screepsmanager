@@ -8,11 +8,12 @@ https://github.com/openscreeps/openapi, copied byte for byte from:
 It is licensed under the ISC License in LICENSE (copied from the same
 commit, blob 021d06101034112c437098f09f6db141d345d406).
 
-The tests of src/api.rs check every request of the API client against it.
+The tests of src/api/contract.rs check every request of the API client
+against it.
 To move to another commit of a checkout of openscreeps/openapi:
 
   git -C OPENAPI show COMMIT:openapi.json > contract/openapi.json
   git -C OPENAPI show COMMIT:LICENSE > contract/LICENSE
   git hash-object contract/openapi.json contract/LICENSE
 
-and update the commit and the blobs here and in src/api.rs.
+and update the commit and the blobs here and in src/api/contract.rs.

@@ -271,8 +271,9 @@ fn run(
             Err(_) => return Err(Error::Unclosed),
         }
     }
-    let ((stdout, overflow), (stderr, _)) =
-        (stdout.unwrap_or_default(), stderr.unwrap_or_default());
+    let (Some((stdout, overflow)), Some((stderr, _))) = (stdout, stderr) else {
+        return Err(Error::Unclosed);
+    };
     Ok(Run {
         status,
         stdout,
