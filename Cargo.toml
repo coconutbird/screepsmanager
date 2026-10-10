@@ -1,6 +1,6 @@
 [package]
 name = "screepsmanager"
-description = "Uploads built Screeps code (JavaScript, source maps, WebAssembly) to the branches of Screeps servers through named profiles: the official server, seasonal servers, and private servers."
+description = "Uploads built Screeps code (JavaScript, source maps, WebAssembly) to the branches of Screeps servers through named profiles: the official server, seasonal servers, and private servers; and keeps a spawn of the account in the world."
 edition = "2024"
 version = "0.1.0"
 publish = false
@@ -28,6 +28,12 @@ thiserror = "2"
 url = "2"
 # The binary modules (WebAssembly) of an upload are base64 text.
 base64 = "0.23"
+# The heartbeat that the bot keeps in Memory, which the API returns as
+# gzip; the pure-Rust backend needs no C toolchain.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# `--env-file`: the dotenv format that other tools write, quotes, escapes,
+# and substitutions included.
+dotenvy = "0.15"
 
 [lints.rust]
 warnings = { level = "deny", priority = -2 }

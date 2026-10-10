@@ -8,9 +8,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::Error;
-use crate::api::Client;
+use crate::api::{Access, Client};
 use crate::branch::{Active, Branch, BranchName};
 use crate::config::{Config, ProfileName, Selected, ServerName};
+use crate::envfile::EnvFile;
 use crate::modules::{self, Modules};
 
 /// The arguments of `upload`.
@@ -44,8 +45,14 @@ pub(crate) struct Upload {
 }
 
 impl Upload {
-    /// Runs the upload with `config` and prints each step to `out`.
-    pub(crate) fn run(self, config: &Config, out: &mut dyn Write) -> Result<(), Error> {
+    /// Runs the upload with `config` and the `--env-file` variables `env`,
+    /// and prints each step to `out`.
+    pub(crate) fn run(
+        self,
+        config: &Config,
+        env: &EnvFile,
+        out: &mut dyn Write,
+    ) -> Result<(), Error> {
         let targets = config.select(&self.profiles)?;
         let dir = self.dir.as_deref().unwrap_or(&config.dir);
         let build = modules::read(dir)?;
@@ -108,7 +115,7 @@ impl Upload {
             let credentials = target
                 .server
                 .auth
-                .resolve()
+                .resolve(env)
                 .map_err(|source| Error::Secret {
                     server: target.profile.server.clone(),
                     source,
@@ -120,7 +127,7 @@ impl Upload {
             let client = match clients.entry(&target.profile.server) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => entry.insert(
-                    Client::sign_in(&target.server.url, &credentials)
+                    Client::sign_in(&target.server.url, &credentials, Access::ReadWrite)
                         .map_err(|source| api_error(&target, source))?,
                 ),
             };

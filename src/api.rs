@@ -1,26 +1,46 @@
-//! The calls of the Screeps API that an upload makes ([`Endpoint`]). The
-//! paths are under the URL of the server (`https://screeps.com/season/`):
+//! The calls of the Screeps API that `upload` and `poll` make
+//! ([`Endpoint`]). The paths are under the URL of the server
+//! (`https://screeps.com/season/`):
 //!
 //! ```text
-//! POST api/auth/signin             {"email", "password"} -> {"token"}
-//! GET  api/user/branches           -> {"list": [{"branch", "activeWorld", "activeSim"}, ...]}
-//! POST api/user/clone-branch       {"branch": "", "newName", "defaultModules"}
-//! POST api/user/code               {"branch", "modules"}
-//! POST api/user/set-active-branch  {"branch", "activeName"}
+//! POST api/auth/signin                   {"email", "password"} -> {"token"}
+//! GET  api/auth/me                       -> {"username", "cpu", "cpuShard", "lastRespawnDate"}
+//! GET  api/user/branches                 -> {"list": [{"branch", "activeWorld", "activeSim"}, ...]}
+//! POST api/user/clone-branch             {"branch": "", "newName", "defaultModules"}
+//! POST api/user/code                     {"branch", "modules"}
+//! POST api/user/set-active-branch        {"branch", "activeName"}
+//! GET  api/game/shards/info              -> {"shards": [{"name"}, ...]}
+//! GET  api/game/time?shard               -> {"time"}
+//! GET  api/user/world-status?shard       -> {"status": "normal" | "lost" | "empty"}
+//! GET  api/user/world-start-room?shard   -> {"room": ["W1N1"]}
+//! GET  api/user/respawn-prohibited-rooms?shard -> {"rooms": ["W1N1", ...]}
+//! GET  api/user/memory?path&shard        -> {"data": "gz:" + base64(gzip(JSON))}
+//! POST api/game/map-stats                {"rooms", "statName": "owner0", "shard"} -> {"stats": {ROOM: {...}}}
+//! GET  api/game/room-status?room&shard   -> {"room": {"status", "novice", "respawnArea", "openTime"}}
+//! GET  api/game/room-terrain?room&encoded=1&shard -> {"terrain": [{"room", "terrain"}]}
+//! GET  api/game/room-objects?room&shard  -> {"objects": [...], "users": {...}}
+//! POST api/user/respawn                  {}
+//! POST api/game/place-spawn              {"room", "name", "x", "y", "shard"}
 //! ```
 //!
 //! Every call after sign-in sends the token as `X-Token` and `X-Username`;
 //! an answer with an `X-Token` header replaces the token. The server answers
 //! `{"ok": 1, ...}`, or `{"error": "..."}` with status 200 when it refuses.
+//! The client follows no redirect, so that the token goes to the configured
+//! server only, and a read-only client refuses every call that changes the
+//! account or the world ([`Endpoint::changes_world`]) before it sends it.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::{Client as Http, RequestBuilder};
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
+use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::branch::{Active, BranchName};
 use crate::config::{Credentials, Sensitive, ServerUrl};
@@ -43,6 +63,8 @@ const RATE_LIMIT_RESET: &str = "x-ratelimit-reset";
 pub(crate) enum Endpoint {
     /// Signs in with an email and a password.
     SignIn,
+    /// The account: its name, CPU, and last respawn.
+    Me,
     /// Lists the branches of the account.
     Branches,
     /// Creates a branch.
@@ -51,14 +73,54 @@ pub(crate) enum Endpoint {
     Code,
     /// Makes a branch run in the world or the simulator.
     SetActiveBranch,
+    /// The shards of the server.
+    Shards,
+    /// The game time of a shard.
+    Time,
+    /// Whether the account has a spawn, other objects, or nothing.
+    WorldStatus,
+    /// The room that the server suggests to start in.
+    WorldStartRoom,
+    /// The rooms where the account may not place its spawn.
+    RespawnProhibitedRooms,
+    /// A path of the Memory of the account.
+    Memory,
+    /// The owners and statuses of rooms (read-only, by POST).
+    MapStats,
+    /// The status of a room.
+    RoomStatus,
+    /// The terrain of a room.
+    RoomTerrain,
+    /// The objects of a room.
+    RoomObjects,
+    /// Removes every object of the account.
+    Respawn,
+    /// Places the first spawn of the account.
+    PlaceSpawn,
 }
 
 impl Endpoint {
     /// The method of the call.
     fn method(self) -> Method {
         match self {
-            Self::Branches => Method::GET,
-            Self::SignIn | Self::CloneBranch | Self::Code | Self::SetActiveBranch => Method::POST,
+            Self::Me
+            | Self::Branches
+            | Self::Shards
+            | Self::Time
+            | Self::WorldStatus
+            | Self::WorldStartRoom
+            | Self::RespawnProhibitedRooms
+            | Self::Memory
+            | Self::RoomStatus
+            | Self::RoomTerrain
+            | Self::RoomObjects => Method::GET,
+            Self::SignIn
+            | Self::CloneBranch
+            | Self::Code
+            | Self::SetActiveBranch
+            | Self::MapStats
+            | Self::Respawn
+            | Self::PlaceSpawn => Method::POST,
         }
     }
 
@@ -66,10 +128,48 @@ impl Endpoint {
     fn path(self) -> &'static str {
         match self {
             Self::SignIn => "api/auth/signin",
+            Self::Me => "api/auth/me",
             Self::Branches => "api/user/branches",
             Self::CloneBranch => "api/user/clone-branch",
             Self::Code => "api/user/code",
             Self::SetActiveBranch => "api/user/set-active-branch",
+            Self::Shards => "api/game/shards/info",
+            Self::Time => "api/game/time",
+            Self::WorldStatus => "api/user/world-status",
+            Self::WorldStartRoom => "api/user/world-start-room",
+            Self::RespawnProhibitedRooms => "api/user/respawn-prohibited-rooms",
+            Self::Memory => "api/user/memory",
+            Self::MapStats => "api/game/map-stats",
+            Self::RoomStatus => "api/game/room-status",
+            Self::RoomTerrain => "api/game/room-terrain",
+            Self::RoomObjects => "api/game/room-objects",
+            Self::Respawn => "api/user/respawn",
+            Self::PlaceSpawn => "api/game/place-spawn",
+        }
+    }
+
+    /// Whether the call changes the code, the branches, or the objects of
+    /// the account: what a read-only client refuses.
+    pub(crate) fn changes_world(self) -> bool {
+        match self {
+            Self::CloneBranch
+            | Self::Code
+            | Self::SetActiveBranch
+            | Self::Respawn
+            | Self::PlaceSpawn => true,
+            Self::SignIn
+            | Self::Me
+            | Self::Branches
+            | Self::Shards
+            | Self::Time
+            | Self::WorldStatus
+            | Self::WorldStartRoom
+            | Self::RespawnProhibitedRooms
+            | Self::Memory
+            | Self::MapStats
+            | Self::RoomStatus
+            | Self::RoomTerrain
+            | Self::RoomObjects => false,
         }
     }
 }
@@ -104,17 +204,84 @@ impl BranchInfo {
     }
 }
 
+/// The account, as `auth/me` has it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Me {
+    /// The name of the account.
+    pub(crate) username: String,
+    /// The CPU of the account: of every shard together on a server with
+    /// shards.
+    pub(crate) cpu: f64,
+    /// The CPU of each shard, on a server with shards.
+    #[serde(default)]
+    pub(crate) cpu_shard: Option<BTreeMap<String, f64>>,
+    /// When the account last respawned, in milliseconds since the Unix
+    /// epoch.
+    #[serde(default)]
+    pub(crate) last_respawn_date: Option<f64>,
+}
+
+/// What the account has in the world of a shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum WorldStatus {
+    /// A spawn.
+    Normal,
+    /// Objects, but no spawn.
+    Lost,
+    /// No object.
+    Empty,
+}
+
+impl fmt::Display for WorldStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Normal => "normal",
+            Self::Lost => "lost",
+            Self::Empty => "empty",
+        })
+    }
+}
+
+/// The spawn that [`Client::place_spawn`] places.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PlaceSpawn<'a> {
+    /// The room.
+    pub(crate) room: &'a str,
+    /// The name of the spawn.
+    pub(crate) name: &'a str,
+    /// The column, 0 to 49.
+    pub(crate) x: u8,
+    /// The row, 0 to 49.
+    pub(crate) y: u8,
+    /// The shard, on a server with shards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shard: Option<&'a str>,
+}
+
+/// What a client may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// Only calls that do not change the world ([`Endpoint::changes_world`]).
+    ReadOnly,
+    /// Every call.
+    ReadWrite,
+}
+
 /// A client of one server, signed in.
 pub(crate) struct Client {
     http: Http,
     url: ServerUrl,
     token: HeaderValue,
+    access: Access,
 }
 
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("url", &self.url)
+            .field("access", &self.access)
             .finish_non_exhaustive()
     }
 }
@@ -122,12 +289,18 @@ impl fmt::Debug for Client {
 impl Client {
     /// A client of the server at `url`, signed in with `credentials`: a
     /// token as it is, an email and a password through [`Endpoint::SignIn`].
+    /// With [`Access::ReadOnly`], it refuses the calls that change the
+    /// world.
     ///
     /// # Errors
     ///
     /// When the HTTP client does not build, the sign-in fails, or the token
     /// is not a valid header value.
-    pub(crate) fn sign_in(url: &ServerUrl, credentials: &Credentials<'_>) -> Result<Self, Error> {
+    pub(crate) fn sign_in(
+        url: &ServerUrl,
+        credentials: &Credentials<'_>,
+        access: Access,
+    ) -> Result<Self, Error> {
         #[derive(Serialize)]
         struct SignIn<'a> {
             email: &'a str,
@@ -140,6 +313,7 @@ impl Client {
 
         let http = Http::builder()
             .timeout(TIMEOUT)
+            .redirect(Policy::none())
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
@@ -154,7 +328,7 @@ impl Client {
                     email,
                     password: password.expose(),
                 };
-                let request = request(&http, url, Endpoint::SignIn)?.json(&body);
+                let request = request(&http, url, Endpoint::SignIn, &[])?.json(&body);
                 let reply: SignedIn = call(Endpoint::SignIn, request)?.0;
                 Sensitive::new(reply.token)
             }
@@ -165,7 +339,17 @@ impl Client {
             http,
             url: url.clone(),
             token,
+            access,
         })
+    }
+
+    /// The account.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn me(&mut self) -> Result<Me, Error> {
+        self.call(Endpoint::Me, &[], None::<&()>)
     }
 
     /// The branches of the account.
@@ -179,7 +363,7 @@ impl Client {
             list: Vec<BranchInfo>,
         }
 
-        let reply: Branches = self.call(Endpoint::Branches, None::<&()>)?;
+        let reply: Branches = self.call(Endpoint::Branches, &[], None::<&()>)?;
         Ok(reply.list)
     }
 
@@ -207,7 +391,7 @@ impl Client {
             new_name: branch,
             default_modules: modules,
         };
-        self.call::<IgnoredAny>(Endpoint::CloneBranch, Some(&body))?;
+        self.call::<IgnoredAny>(Endpoint::CloneBranch, &[], Some(&body))?;
         Ok(())
     }
 
@@ -224,7 +408,7 @@ impl Client {
             modules: &'a Modules,
         }
 
-        self.call::<IgnoredAny>(Endpoint::Code, Some(&Code { branch, modules }))?;
+        self.call::<IgnoredAny>(Endpoint::Code, &[], Some(&Code { branch, modules }))?;
         Ok(())
     }
 
@@ -249,18 +433,275 @@ impl Client {
             branch,
             active_name: active.api_name(),
         };
-        self.call::<IgnoredAny>(Endpoint::SetActiveBranch, Some(&body))?;
+        self.call::<IgnoredAny>(Endpoint::SetActiveBranch, &[], Some(&body))?;
         Ok(())
     }
 
-    /// The data of the call `endpoint` with `body` and the token, which a
-    /// new token of the answer replaces.
+    /// The names of the shards of the server.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails, for example on a server without shards.
+    pub(crate) fn shards(&mut self) -> Result<Vec<String>, Error> {
+        #[derive(Deserialize)]
+        struct Shard {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        struct Shards {
+            shards: Vec<Shard>,
+        }
+
+        let reply: Shards = self.call(Endpoint::Shards, &[], None::<&()>)?;
+        Ok(reply.shards.into_iter().map(|shard| shard.name).collect())
+    }
+
+    /// The game time of `shard`.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn time(&mut self, shard: Option<&str>) -> Result<u64, Error> {
+        #[derive(Deserialize)]
+        struct Time {
+            time: u64,
+        }
+
+        let reply: Time = self.call(Endpoint::Time, &query(&[], shard), None::<&()>)?;
+        Ok(reply.time)
+    }
+
+    /// What the account has in the world of `shard`.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails, or the status is not one that this client
+    /// knows.
+    pub(crate) fn world_status(&mut self, shard: Option<&str>) -> Result<WorldStatus, Error> {
+        #[derive(Deserialize)]
+        struct Status {
+            status: WorldStatus,
+        }
+
+        let reply: Status = self.call(Endpoint::WorldStatus, &query(&[], shard), None::<&()>)?;
+        Ok(reply.status)
+    }
+
+    /// The rooms that the server suggests to start in on `shard`, as it
+    /// writes them (some servers prefix `shard/`).
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn world_start_room(&mut self, shard: Option<&str>) -> Result<Vec<String>, Error> {
+        #[derive(Deserialize)]
+        struct Start {
+            room: Vec<String>,
+        }
+
+        let reply: Start = self.call(Endpoint::WorldStartRoom, &query(&[], shard), None::<&()>)?;
+        Ok(reply.room)
+    }
+
+    /// The rooms of `shard` where the account may not place its spawn, as
+    /// the server writes them.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn respawn_prohibited_rooms(
+        &mut self,
+        shard: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        #[derive(Deserialize)]
+        struct Rooms {
+            rooms: Vec<String>,
+        }
+
+        let reply: Rooms = self.call(
+            Endpoint::RespawnProhibitedRooms,
+            &query(&[], shard),
+            None::<&()>,
+        )?;
+        Ok(reply.rooms)
+    }
+
+    /// The Memory of the account at `path` on `shard` as the server encodes
+    /// it (`gz:` and base64 of gzip of JSON), or none when it has no data.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn memory(
+        &mut self,
+        path: &str,
+        shard: Option<&str>,
+    ) -> Result<Option<String>, Error> {
+        #[derive(Deserialize)]
+        struct Memory {
+            #[serde(default)]
+            data: Option<String>,
+        }
+
+        let reply: Memory = self.call(
+            Endpoint::Memory,
+            &query(&[("path", path)], shard),
+            None::<&()>,
+        )?;
+        Ok(reply.data)
+    }
+
+    /// The owner statistics (`owner0`) of `rooms` on `shard`: per room its
+    /// status, owner or reservation (`own`), and novice and respawn areas.
+    /// The call is a POST that changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn map_stats(
+        &mut self,
+        rooms: &[String],
+        shard: Option<&str>,
+    ) -> Result<BTreeMap<String, Value>, Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct MapStats<'a> {
+            rooms: &'a [String],
+            stat_name: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            shard: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct Stats {
+            stats: BTreeMap<String, Value>,
+        }
+
+        let body = MapStats {
+            rooms,
+            stat_name: "owner0",
+            shard,
+        };
+        let reply: Stats = self.call(Endpoint::MapStats, &[], Some(&body))?;
+        Ok(reply.stats)
+    }
+
+    /// The status fields of `room` on `shard`, or none when the server has
+    /// no such room.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn room_status(
+        &mut self,
+        room: &str,
+        shard: Option<&str>,
+    ) -> Result<Option<Map<String, Value>>, Error> {
+        #[derive(Deserialize)]
+        struct Status {
+            #[serde(default)]
+            room: Option<Map<String, Value>>,
+        }
+
+        let reply: Status = self.call(
+            Endpoint::RoomStatus,
+            &query(&[("room", room)], shard),
+            None::<&()>,
+        )?;
+        Ok(reply.room)
+    }
+
+    /// The encoded terrain of `room` on `shard` (2500 digits, row by row),
+    /// or none when the answer has none for the room.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn room_terrain(
+        &mut self,
+        room: &str,
+        shard: Option<&str>,
+    ) -> Result<Option<String>, Error> {
+        #[derive(Deserialize)]
+        struct Entry {
+            #[serde(default)]
+            room: Option<String>,
+            terrain: String,
+        }
+        #[derive(Deserialize)]
+        struct Terrain {
+            terrain: Vec<Entry>,
+        }
+
+        let reply: Terrain = self.call(
+            Endpoint::RoomTerrain,
+            &query(&[("room", room), ("encoded", "1")], shard),
+            None::<&()>,
+        )?;
+        Ok(reply
+            .terrain
+            .into_iter()
+            .find(|entry| entry.room.as_deref().is_none_or(|name| name == room))
+            .map(|entry| entry.terrain))
+    }
+
+    /// The objects of `room` on `shard`, as the server has them.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub(crate) fn room_objects(
+        &mut self,
+        room: &str,
+        shard: Option<&str>,
+    ) -> Result<Vec<Value>, Error> {
+        #[derive(Deserialize)]
+        struct Objects {
+            objects: Vec<Value>,
+        }
+
+        let reply: Objects = self.call(
+            Endpoint::RoomObjects,
+            &query(&[("room", room)], shard),
+            None::<&()>,
+        )?;
+        Ok(reply.objects)
+    }
+
+    /// Removes every object of the account on every shard, so that it can
+    /// place a spawn again.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails; [`Error::unapplied`] says whether the account
+    /// may have respawned anyway.
+    pub(crate) fn respawn(&mut self) -> Result<(), Error> {
+        self.call::<IgnoredAny>(Endpoint::Respawn, &[], Some(&Map::new()))?;
+        Ok(())
+    }
+
+    /// Places the first spawn of the account.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails; [`Error::unapplied`] says whether the spawn may
+    /// have been placed anyway.
+    pub(crate) fn place_spawn(&mut self, spawn: &PlaceSpawn<'_>) -> Result<(), Error> {
+        self.call::<IgnoredAny>(Endpoint::PlaceSpawn, &[], Some(spawn))?;
+        Ok(())
+    }
+
+    /// The data of the call `endpoint` with the query `query`, `body`, and
+    /// the token, which a new token of the answer replaces.
     fn call<T: DeserializeOwned>(
         &mut self,
         endpoint: Endpoint,
+        query: &[(&str, &str)],
         body: Option<&impl Serialize>,
     ) -> Result<T, Error> {
-        let mut request = request(&self.http, &self.url, endpoint)?
+        if self.access == Access::ReadOnly && endpoint.changes_world() {
+            return Err(Error::ReadOnly { endpoint });
+        }
+        let mut request = request(&self.http, &self.url, endpoint, query)?
             .header(TOKEN, self.token.clone())
             .header(USERNAME, self.token.clone());
         if let Some(body) = body {
@@ -275,12 +716,42 @@ impl Client {
     }
 }
 
-/// The request of `endpoint` on the server at `url`.
-fn request(http: &Http, url: &ServerUrl, endpoint: Endpoint) -> Result<RequestBuilder, Error> {
-    let url = url
+/// The query `pairs`, and `shard` when there is one.
+fn query<'a>(
+    pairs: &[(&'static str, &'a str)],
+    shard: Option<&'a str>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut query = pairs.to_vec();
+    if let Some(shard) = shard {
+        query.push(("shard", shard));
+    }
+    query
+}
+
+/// The URL of `endpoint` with the query `query` on the server at `server`.
+fn endpoint_url(
+    server: &ServerUrl,
+    endpoint: Endpoint,
+    query: &[(&str, &str)],
+) -> Result<url::Url, Error> {
+    let mut url = server
         .join(endpoint.path())
         .map_err(|source| Error::Url { endpoint, source })?;
-    Ok(http.request(endpoint.method(), url))
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query);
+    }
+    Ok(url)
+}
+
+/// The request of `endpoint` with the query `query` on the server at
+/// `server`.
+fn request(
+    http: &Http,
+    server: &ServerUrl,
+    endpoint: Endpoint,
+    query: &[(&str, &str)],
+) -> Result<RequestBuilder, Error> {
+    Ok(http.request(endpoint.method(), endpoint_url(server, endpoint, query)?))
 }
 
 /// Sends `request` of `endpoint`, and returns the data of the answer and
@@ -385,6 +856,13 @@ pub(crate) enum Error {
     /// The token is not a valid header value.
     #[error("the token is not a valid header value")]
     Token(#[source] InvalidHeaderValue),
+    /// A read-only client refused a call that changes the world, without
+    /// sending it.
+    #[error("{endpoint}: not sent: changes the world, and this run is read-only")]
+    ReadOnly {
+        /// The call.
+        endpoint: Endpoint,
+    },
     /// The URL of the call does not parse.
     #[error("{endpoint}: {source}")]
     Url {
@@ -453,6 +931,26 @@ pub(crate) enum Error {
     },
 }
 
+impl Error {
+    /// Whether the call surely changed nothing on the server: it was not
+    /// sent, or the server refused it, the credentials, or the rate.
+    /// Otherwise a call that changes the world may have happened, and
+    /// only a fresh read of the world tells.
+    pub(crate) fn unapplied(&self) -> bool {
+        match self {
+            Self::Client(_)
+            | Self::Token(_)
+            | Self::ReadOnly { .. }
+            | Self::Url { .. }
+            | Self::Refused { .. }
+            | Self::Unauthorized { .. }
+            | Self::RateLimited { .. } => true,
+            Self::Request { source, .. } => source.is_connect() || source.is_builder(),
+            Self::Status { .. } | Self::NotOk { .. } | Self::Answer { .. } => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +1003,140 @@ mod tests {
         .expect("branches parse");
         assert!(list[0].runs_in(Active::World) && !list[0].runs_in(Active::Sim));
         assert!(!list[1].runs_in(Active::World) && !list[1].runs_in(Active::Sim));
+    }
+
+    /// Queries are encoded under the server URL; the shard is last.
+    #[test]
+    fn queries() {
+        let server = ServerUrl::try_from("https://screeps.com/season".to_owned()).expect("a URL");
+        let url = endpoint_url(
+            &server,
+            Endpoint::RoomTerrain,
+            &query(&[("room", "W1N1"), ("encoded", "1")], Some("shard 3&x")),
+        )
+        .expect("a URL");
+        assert_eq!(
+            url.as_str(),
+            "https://screeps.com/season/api/game/room-terrain?room=W1N1&encoded=1&shard=shard+3%26x"
+        );
+        let bare = endpoint_url(&server, Endpoint::Me, &query(&[], None)).expect("a URL");
+        assert_eq!(bare.as_str(), "https://screeps.com/season/api/auth/me");
+    }
+
+    /// Only code, branch, respawn, and spawn calls change the world;
+    /// map-stats is a POST that reads.
+    #[test]
+    fn world_changes() {
+        for endpoint in [
+            Endpoint::CloneBranch,
+            Endpoint::Code,
+            Endpoint::SetActiveBranch,
+            Endpoint::Respawn,
+            Endpoint::PlaceSpawn,
+        ] {
+            assert!(endpoint.changes_world(), "{endpoint}");
+        }
+        for endpoint in [
+            Endpoint::SignIn,
+            Endpoint::Me,
+            Endpoint::MapStats,
+            Endpoint::Memory,
+            Endpoint::WorldStatus,
+            Endpoint::RoomObjects,
+        ] {
+            assert!(!endpoint.changes_world(), "{endpoint}");
+        }
+        assert!(
+            Error::ReadOnly {
+                endpoint: Endpoint::Respawn
+            }
+            .unapplied()
+        );
+        let refused = Error::Refused {
+            endpoint: Endpoint::PlaceSpawn,
+            message: "invalid room".to_owned(),
+        };
+        assert!(refused.unapplied());
+        let unknown = Error::Status {
+            endpoint: Endpoint::PlaceSpawn,
+            status: StatusCode::BAD_GATEWAY,
+            body: String::new(),
+        };
+        assert!(!unknown.unapplied());
+    }
+
+    /// A read-only client refuses world changes before it sends them.
+    #[test]
+    fn read_only() {
+        // reqwest takes TLS from the process-wide provider, which `main`
+        // installs.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = ServerUrl::try_from("http://127.0.0.1:9".to_owned()).expect("a URL");
+        let mut client = Client::sign_in(
+            &server,
+            &Credentials::Token(Sensitive::new("t".to_owned())),
+            Access::ReadOnly,
+        )
+        .expect("a client");
+        assert!(matches!(
+            client.respawn(),
+            Err(Error::ReadOnly {
+                endpoint: Endpoint::Respawn
+            })
+        ));
+        let spawn = PlaceSpawn {
+            room: "W1N1",
+            name: "Spawn1",
+            x: 25,
+            y: 25,
+            shard: Some("shard3"),
+        };
+        assert!(matches!(
+            client.place_spawn(&spawn),
+            Err(Error::ReadOnly { .. })
+        ));
+        assert_eq!(
+            serde_json::to_value(&spawn).expect("JSON"),
+            serde_json::json!({"room": "W1N1", "name": "Spawn1", "x": 25, "y": 25, "shard": "shard3"})
+        );
+    }
+
+    /// The account and world answers parse; an unknown world status is an
+    /// error, not an empty world.
+    #[test]
+    fn world_answers() {
+        #[derive(Debug, Deserialize)]
+        struct Status {
+            status: WorldStatus,
+        }
+
+        let me: Me = reply(
+            Endpoint::Me,
+            StatusCode::OK,
+            r#"{"ok":1,"_id":"u","username":"me","cpu":60,"cpuShard":{"shard3":60},"lastRespawnDate":1700000000000}"#.to_owned(),
+        )
+        .expect("auth/me parses");
+        assert_eq!(
+            me.cpu_shard.and_then(|cpu| cpu.get("shard3").copied()),
+            Some(60.0)
+        );
+        assert_eq!(me.last_respawn_date, Some(1_700_000_000_000.0));
+
+        let status =
+            |text: &str| reply::<Status>(Endpoint::WorldStatus, StatusCode::OK, text.to_owned());
+        assert_eq!(
+            status(r#"{"ok":1,"status":"empty"}"#)
+                .map(|s| s.status)
+                .ok(),
+            Some(WorldStatus::Empty)
+        );
+        assert!(matches!(
+            status(r#"{"ok":1,"status":"gone"}"#),
+            Err(Error::Answer { .. })
+        ));
+        assert!(matches!(
+            reply::<Status>(Endpoint::WorldStatus, StatusCode::FOUND, String::new()),
+            Err(Error::Status { .. })
+        ));
     }
 }

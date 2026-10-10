@@ -36,22 +36,36 @@
 //! A server is the URL that the API is under (`http` or `https`) and the
 //! credentials of an account on it: `token`, or `email` and `password` for
 //! a private server with password sign-in (screepsmod-auth). A secret is a
-//! string, or `{ env = "VARIABLE" }` to read it from the environment when an
-//! upload needs it. A profile is a server, a branch (`default` when not
-//! set; `auto` is the current git branch), and where the upload makes the
-//! branch run (`world`, `sim`). A key that the format does not have is an
-//! error.
+//! string, or `{ env = "VARIABLE" }` to read it from the environment, or
+//! else from the `--env-file` ([`EnvFile`]), when a command needs it. A
+//! profile is a server, a branch (`default` when not set; `auto` is the
+//! current git branch), and where the upload makes the branch run
+//! (`world`, `sim`). A key that the format does not have is an error.
+//!
+//! A profile with a spawn table is one that `poll` keeps a spawn of:
+//!
+//! ```toml
+//! [profiles.main.spawn]
+//! selector = ["node", "scripts/select-spawn.mjs"]  # argv, no shell; runs next to this file
+//! shard = "auto"      # the one shard with CPU, a shard name, or unset without shards
+//! interval = 60       # seconds between polls (60..=86400)
+//! radius = 5          # rooms around the start room that candidates come from (1..=10)
+//! candidates = 16     # the most rooms that the selector chooses from (1..=64)
+//! ```
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use url::Url;
 
 use crate::branch::{Active, Branch};
+use crate::envfile::EnvFile;
 
 /// The name of the configuration file that `upload` and `profiles` look
 /// for in the working directory and its parents.
@@ -109,6 +123,18 @@ name!(
     ProfileName,
     "profile"
 );
+name!(
+    /// The name of a shard of a server (`shard3`).
+    ShardName,
+    "shard"
+);
+
+impl ShardName {
+    /// The name as the API takes it.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// A server or profile name with other characters than letters, digits,
 /// `-`, `_`, and `.`.
@@ -222,21 +248,31 @@ pub(crate) enum Secret {
 }
 
 impl Secret {
-    /// The value of the secret.
+    /// The value of the secret: a variable comes from the process
+    /// environment, or else from the `--env-file` variables `env`.
     ///
     /// # Errors
     ///
     /// When the environment variable is not set, not Unicode, or empty.
-    pub(crate) fn resolve(&self) -> Result<Sensitive, SecretError> {
+    pub(crate) fn resolve(&self, env: &EnvFile) -> Result<Sensitive, SecretError> {
+        self.resolve_with(env, &|name: &str| std::env::var(name))
+    }
+
+    /// The value of the secret, with `process` for the process environment.
+    fn resolve_with(
+        &self,
+        env: &EnvFile,
+        process: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> Result<Sensitive, SecretError> {
         match self {
             Self::Value(value) => Ok(value.clone()),
-            Self::Env(variable) => match std::env::var(variable) {
-                Ok(value) if value.is_empty() => Err(SecretError::Empty(variable.clone())),
-                Ok(value) => Ok(Sensitive(value)),
-                Err(std::env::VarError::NotPresent) => Err(SecretError::NotSet(variable.clone())),
-                Err(std::env::VarError::NotUnicode(_)) => {
-                    Err(SecretError::NotUnicode(variable.clone()))
+            Self::Env(variable) => match env.var(variable, process) {
+                Ok(Some(value)) if value.expose().is_empty() => {
+                    Err(SecretError::Empty(variable.clone()))
                 }
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => Err(SecretError::NotSet(variable.clone())),
+                Err(_) => Err(SecretError::NotUnicode(variable.clone())),
             },
         }
     }
@@ -296,8 +332,8 @@ impl<'de> Deserialize<'de> for Secret {
 /// A secret that is not available.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SecretError {
-    /// The variable is not set.
-    #[error("${0} is not set")]
+    /// The variable is not set, in the environment or the env file.
+    #[error("${0} is not set (in the environment or --env-file)")]
     NotSet(String),
     /// The value of the variable is not Unicode.
     #[error("${0} is not Unicode")]
@@ -322,17 +358,18 @@ pub(crate) enum Auth {
 }
 
 impl Auth {
-    /// The credentials, with the secret read.
+    /// The credentials, with the secret read from the file, the
+    /// environment, or the `--env-file` variables `env`.
     ///
     /// # Errors
     ///
     /// When the secret is not available.
-    pub(crate) fn resolve(&self) -> Result<Credentials<'_>, SecretError> {
+    pub(crate) fn resolve(&self, env: &EnvFile) -> Result<Credentials<'_>, SecretError> {
         Ok(match self {
-            Self::Token(token) => Credentials::Token(token.resolve()?),
+            Self::Token(token) => Credentials::Token(token.resolve(env)?),
             Self::Password { email, password } => Credentials::Password {
                 email,
-                password: password.resolve()?,
+                password: password.resolve(env)?,
             },
         })
     }
@@ -409,7 +446,8 @@ pub(crate) enum AuthError {
     Both,
 }
 
-/// A profile: a server, a branch, and where the upload makes it run.
+/// A profile: a server, a branch, where the upload makes it run, and how
+/// `poll` keeps a spawn in the world.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Profile {
@@ -421,6 +459,149 @@ pub(crate) struct Profile {
     /// Where the upload makes the branch run.
     #[serde(default)]
     pub(crate) activate: Vec<Active>,
+    /// How `poll` places the spawn of the account; `poll` skips a profile
+    /// without it.
+    pub(crate) spawn: Option<Spawn>,
+}
+
+/// The shard of a spawn: `auto`, the one shard with CPU, or a name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub(crate) enum ShardChoice {
+    /// The only shard where the account has CPU.
+    Auto,
+    /// The shard of this name.
+    Named(ShardName),
+}
+
+impl TryFrom<String> for ShardChoice {
+    type Error = InvalidName;
+
+    fn try_from(name: String) -> Result<Self, InvalidName> {
+        if name == "auto" {
+            Ok(Self::Auto)
+        } else {
+            ShardName::try_from(name).map(Self::Named)
+        }
+    }
+}
+
+impl fmt::Display for ShardChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.pad("auto"),
+            Self::Named(name) => name.fmt(f),
+        }
+    }
+}
+
+/// How `poll` places the spawn of a profile's account.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "SpawnFile")]
+pub(crate) struct Spawn {
+    /// The program and arguments of the selector (no shell), which runs in
+    /// the directory of the configuration file.
+    pub(crate) selector: Vec<String>,
+    /// The shard; none on a private server without shards.
+    pub(crate) shard: Option<ShardChoice>,
+    /// The time between two polls.
+    pub(crate) interval: Duration,
+    /// How many rooms around the start room of the server, in each
+    /// direction, the candidates come from.
+    pub(crate) radius: u32,
+    /// The most candidate rooms that the selector chooses from.
+    pub(crate) candidates: usize,
+}
+
+impl Spawn {
+    /// The bounds of `interval`, in seconds: the official server allows
+    /// one Memory read a minute.
+    pub(crate) const INTERVAL: RangeInclusive<u64> = 60..=86_400;
+    /// The bounds of `radius`.
+    pub(crate) const RADIUS: RangeInclusive<u64> = 1..=10;
+    /// The bounds of `candidates`.
+    pub(crate) const CANDIDATES: RangeInclusive<u64> = 1..=64;
+    /// The default of `interval`, in seconds.
+    const DEFAULT_INTERVAL: u64 = 60;
+    /// The default of `radius`.
+    const DEFAULT_RADIUS: u64 = 5;
+    /// The default of `candidates`.
+    const DEFAULT_CANDIDATES: u64 = 16;
+}
+
+/// A spawn table as the file writes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnFile {
+    selector: Vec<String>,
+    shard: Option<ShardChoice>,
+    interval: Option<u64>,
+    radius: Option<u64>,
+    candidates: Option<u64>,
+}
+
+impl TryFrom<SpawnFile> for Spawn {
+    type Error = SpawnError;
+
+    fn try_from(file: SpawnFile) -> Result<Self, SpawnError> {
+        if file.selector.first().is_none_or(String::is_empty) {
+            return Err(SpawnError::Selector);
+        }
+        let bounded = |key, value: Option<u64>, default, range: RangeInclusive<u64>| {
+            let value = value.unwrap_or(default);
+            if range.contains(&value) {
+                Ok(value)
+            } else {
+                Err(SpawnError::Range { key, value, range })
+            }
+        };
+        let interval = bounded(
+            "interval",
+            file.interval,
+            Self::DEFAULT_INTERVAL,
+            Self::INTERVAL,
+        )?;
+        let radius = bounded("radius", file.radius, Self::DEFAULT_RADIUS, Self::RADIUS)?;
+        let candidates = bounded(
+            "candidates",
+            file.candidates,
+            Self::DEFAULT_CANDIDATES,
+            Self::CANDIDATES,
+        )?;
+        Ok(Self {
+            selector: file.selector,
+            shard: file.shard,
+            interval: Duration::from_secs(interval),
+            radius: u32::try_from(radius).map_err(|_| SpawnError::Range {
+                key: "radius",
+                value: radius,
+                range: Self::RADIUS,
+            })?,
+            candidates: usize::try_from(candidates).map_err(|_| SpawnError::Range {
+                key: "candidates",
+                value: candidates,
+                range: Self::CANDIDATES,
+            })?,
+        })
+    }
+}
+
+/// A spawn table that is not valid.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SpawnError {
+    /// The selector has no program.
+    #[error("`selector` is the program and its arguments, the program not empty")]
+    Selector,
+    /// A number is out of its bounds.
+    #[error("`{key}` = {value}: use {}..={}", .range.start(), .range.end())]
+    Range {
+        /// The key.
+        key: &'static str,
+        /// The value.
+        value: u64,
+        /// The bounds.
+        range: RangeInclusive<u64>,
+    },
 }
 
 /// The configuration as the file writes it.
@@ -580,6 +761,64 @@ impl Config {
         }
     }
 
+    /// The profiles of `poll`: `names` in order, without repeats, each with
+    /// a spawn table; without names, every profile with one. Two profiles
+    /// of one server are one account, which one poll alone may reset.
+    ///
+    /// # Errors
+    ///
+    /// When a name is not a profile or has no spawn table, no profile has
+    /// one, or two profiles share a server.
+    pub(crate) fn select_spawn(&self, names: &[ProfileName]) -> Result<Vec<Selected<'_>>, Error> {
+        let selected: Vec<Selected<'_>> = if names.is_empty() {
+            self.profiles()
+                .filter(|target| target.profile.spawn.is_some())
+                .collect()
+        } else {
+            let mut selected: Vec<Selected<'_>> = Vec::with_capacity(names.len());
+            for name in names {
+                if selected.iter().all(|other| other.name != name) {
+                    let target = self.profile(name)?;
+                    if target.profile.spawn.is_none() {
+                        return Err(Error::NoSpawn {
+                            path: self.path.clone(),
+                            profile: name.clone(),
+                        });
+                    }
+                    selected.push(target);
+                }
+            }
+            selected
+        };
+        if selected.is_empty() {
+            return Err(Error::NoSpawnProfile {
+                path: self.path.clone(),
+            });
+        }
+        for (at, first) in selected.iter().enumerate() {
+            if let Some(second) = selected[at + 1..]
+                .iter()
+                .find(|other| other.profile.server == first.profile.server)
+            {
+                return Err(Error::SharedServer {
+                    path: self.path.clone(),
+                    first: first.name.clone(),
+                    second: second.name.clone(),
+                    server: first.profile.server.clone(),
+                });
+            }
+        }
+        Ok(selected)
+    }
+
+    /// The directory of the file, where the spawn selector runs.
+    pub(crate) fn root(&self) -> &Path {
+        match self.path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        }
+    }
+
     /// The profile `name`.
     fn profile(&self, name: &ProfileName) -> Result<Selected<'_>, Error> {
         let unknown = || Error::UnknownProfile {
@@ -678,6 +917,35 @@ pub(crate) enum Error {
         /// The profiles of the file.
         profiles: Vec<ProfileName>,
     },
+    /// A profile of `poll` has no spawn table.
+    #[error("{}: profile {profile}: no [profiles.{profile}.spawn] table", .path.display())]
+    NoSpawn {
+        /// The file.
+        path: PathBuf,
+        /// The profile.
+        profile: ProfileName,
+    },
+    /// `poll` without `--profile`, and no profile has a spawn table.
+    #[error("{}: no profile has a [profiles.NAME.spawn] table", .path.display())]
+    NoSpawnProfile {
+        /// The file.
+        path: PathBuf,
+    },
+    /// Two profiles of `poll` share a server, and so an account.
+    #[error(
+        "{}: profiles {first} and {second} share server {server}: poll one profile per account",
+        .path.display()
+    )]
+    SharedServer {
+        /// The file.
+        path: PathBuf,
+        /// The first profile.
+        first: ProfileName,
+        /// The second profile.
+        second: ProfileName,
+        /// The server.
+        server: ServerName,
+    },
     /// The file has no profile.
     #[error("{}: no profile; add a [profiles.NAME] table", .path.display())]
     NoProfile {
@@ -701,6 +969,10 @@ pub(crate) enum Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server and one profile without a spawn table.
+    const SERVER_ONLY_PROFILE: &str =
+        "[servers.s]\nurl = \"https://screeps.com\"\ntoken = \"t\"\n[profiles.p]\nserver = \"s\"\n";
 
     /// The configuration of the module documentation, with `default`.
     const EXAMPLE: &str = r#"
@@ -874,5 +1146,122 @@ mod tests {
             let error = Config::parse(&text, PathBuf::from(FILE_NAME)).expect_err(&text);
             assert!(error.to_string().contains(expected), "{text}\n{error}");
         }
+    }
+
+    /// A spawn table: the selector, `auto` or a shard name or no shard, and
+    /// bounded numbers with defaults.
+    #[test]
+    fn spawn() {
+        let text = format!(
+            "{}[profiles.main.spawn]\nselector = [\"node\", \"scripts/select-spawn.mjs\"]\nshard = \"auto\"\n\
+             [profiles.dev.spawn]\nselector = [\"sel\"]\ninterval = 120\nradius = 3\ncandidates = 4\n\
+             [profiles.season.spawn]\nselector = [\"sel\"]\nshard = \"shardSeason\"\n",
+            EXAMPLE.replace(r#"default = ["main"]"#, "")
+        );
+        let config = parsed(&text);
+        let spawn = |name: &str| {
+            config.select(&profiles(&[name])).expect("a profile")[0]
+                .profile
+                .spawn
+                .clone()
+        };
+        let main = spawn("main").expect("a spawn table");
+        assert_eq!(main.selector, ["node", "scripts/select-spawn.mjs"]);
+        assert_eq!(main.shard, Some(ShardChoice::Auto));
+        assert_eq!(main.interval, Duration::from_secs(60));
+        assert_eq!((main.radius, main.candidates), (5, 16));
+        let dev = spawn("dev").expect("a spawn table");
+        assert_eq!(dev.shard, None);
+        assert_eq!(dev.interval, Duration::from_secs(120));
+        assert_eq!((dev.radius, dev.candidates), (3, 4));
+        assert_eq!(
+            spawn("season").and_then(|s| s.shard).map(|s| s.to_string()),
+            Some("shardSeason".to_owned())
+        );
+        assert_eq!(spawn("sim"), None);
+        assert_eq!(config.root(), Path::new("project"));
+        let bare = Config::parse(SERVER_ONLY_PROFILE, PathBuf::from(FILE_NAME))
+            .expect("a valid configuration");
+        assert_eq!(bare.root(), Path::new("."));
+
+        let all = config.select_spawn(&[]).expect("spawn profiles");
+        assert_eq!(names(&all), ["dev", "main", "season"]);
+        assert!(matches!(
+            config.select_spawn(&profiles(&["sim"])),
+            Err(Error::NoSpawn { .. })
+        ));
+        assert!(matches!(
+            parsed(EXAMPLE).select_spawn(&[]),
+            Err(Error::NoSpawnProfile { .. })
+        ));
+        let shared = text.replace(
+            "[profiles.dev]\n        server = \"local\"",
+            "[profiles.dev]\n        server = \"official\"",
+        );
+        assert_ne!(shared, text, "the replacement applies");
+        assert!(matches!(
+            parsed(&shared).select_spawn(&profiles(&["main", "dev"])),
+            Err(Error::SharedServer { .. })
+        ));
+    }
+
+    /// Spawn tables that are not valid name the problem.
+    #[test]
+    fn invalid_spawn() {
+        let base = format!("{SERVER_ONLY_PROFILE}[profiles.p.spawn]\n");
+        for (text, expected) in [
+            (format!("{base}selector = []\n"), "`selector`"),
+            (format!("{base}selector = [\"\"]\n"), "`selector`"),
+            (format!("{base}shard = \"auto\"\n"), "selector"),
+            (
+                format!("{base}selector = [\"s\"]\ninterval = 5\n"),
+                "`interval` = 5: use 60..=86400",
+            ),
+            (
+                format!("{base}selector = [\"s\"]\nradius = 0\n"),
+                "`radius` = 0",
+            ),
+            (
+                format!("{base}selector = [\"s\"]\ncandidates = 65\n"),
+                "`candidates` = 65",
+            ),
+            (
+                format!("{base}selector = [\"s\"]\nshard = \"a b\"\n"),
+                "a name has",
+            ),
+            (format!("{base}selector = [\"s\"]\nname = \"x\"\n"), "name"),
+        ] {
+            let error = Config::parse(&text, PathBuf::from(FILE_NAME)).expect_err(&text);
+            assert!(error.to_string().contains(expected), "{text}\n{error}");
+        }
+    }
+
+    /// A secret variable comes from the process, or else from the env
+    /// file; empty and missing values are errors that name the variable.
+    #[test]
+    fn secrets() {
+        let file = EnvFile::of(&[("FILE", "from-file"), ("BOTH", "from-file")]);
+        let process = |name: &str| match name {
+            "BOTH" => Ok("from-process".to_owned()),
+            "EMPTY" => Ok(String::new()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let resolve = |name: &str| {
+            Secret::Env(name.to_owned())
+                .resolve_with(&file, &process)
+                .map(|value| value.expose().to_owned())
+        };
+        assert_eq!(resolve("FILE").as_deref(), Ok("from-file"));
+        assert_eq!(resolve("BOTH").as_deref(), Ok("from-process"));
+        assert_eq!(
+            resolve("EMPTY"),
+            Err(SecretError::Empty("EMPTY".to_owned()))
+        );
+        assert_eq!(resolve("NONE"), Err(SecretError::NotSet("NONE".to_owned())));
+        let value = Secret::Value(Sensitive::new("v".to_owned()));
+        assert_eq!(
+            value.resolve_with(&EnvFile::default(), &process),
+            Ok(Sensitive::new("v".to_owned()))
+        );
     }
 }

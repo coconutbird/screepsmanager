@@ -1,15 +1,25 @@
 //! `screepsmanager`: uploads built Screeps code to the branches of Screeps
-//! servers. Run `screepsmanager help` for usage.
+//! servers, and keeps a spawn of the account in the world. Run
+//! `screepsmanager help` for usage.
 //!
 //! The configuration ([`config`]) names servers and profiles: a profile is
-//! a server, a branch, and where the branch runs. `upload` reads the
-//! modules of the build directory ([`modules`]) and replaces the code of
-//! the branch of each selected profile through the Screeps API ([`api`]).
+//! a server, a branch, where the branch runs, and how to place its spawn.
+//! `upload` reads the modules of the build directory ([`modules`]) and
+//! replaces the code of the branch of each selected profile through the
+//! Screeps API ([`api`]). `poll` ([`poll`]) places the spawn of an empty
+//! account where the selector of the bot ([`selector`]) chooses, and resets
+//! an account that its heartbeat ([`heartbeat`]) proves wiped out.
+//! `--env-file` ([`envfile`]) supplies the variables of the secrets.
 
 mod api;
 mod branch;
 mod config;
+mod envfile;
+mod heartbeat;
 mod modules;
+mod poll;
+mod room;
+mod selector;
 mod upload;
 
 use std::io::Write;
@@ -19,8 +29,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use crate::config::{Config, ProfileName, ServerName};
+use crate::envfile::EnvFile;
 
-/// Uploads built Screeps code to the branches of Screeps servers.
+/// Uploads built Screeps code to the branches of Screeps servers, and keeps
+/// a spawn of the account in the world.
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Cli {
@@ -34,6 +46,15 @@ struct Cli {
         value_name = "FILE"
     )]
     config: Option<PathBuf>,
+    /// A dotenv file of the variables of `{ env = "VARIABLE" }` secrets; a
+    /// variable of the environment wins over the file [default: none]
+    #[arg(
+        long,
+        global = true,
+        env = "SCREEPSMANAGER_ENV_FILE",
+        value_name = "FILE"
+    )]
+    env_file: Option<PathBuf>,
     /// The command.
     #[command(subcommand)]
     command: Command,
@@ -53,6 +74,17 @@ enum Command {
     Upload(upload::Upload),
     /// List the profiles of the configuration.
     Profiles,
+    /// Keep a spawn of the account of each profile with a spawn table in
+    /// the world.
+    ///
+    /// Each poll reads the account and its world status. An empty account
+    /// gets its spawn where the selector of the profile chooses among
+    /// candidate rooms, after poll checks the room and the tile again. A
+    /// lost account (objects, no spawn) is reset only when the heartbeat of
+    /// the bot on every lost shard is fresh and counts no foothold, for 180
+    /// s in a row and again right before. Without --execute, poll changes
+    /// nothing and prints what it would do.
+    Poll(poll::Poll),
 }
 
 /// A command that failed.
@@ -61,6 +93,9 @@ enum Error {
     /// The configuration is not available or not valid.
     #[error(transparent)]
     Config(#[from] config::Error),
+    /// The env file is not available or not valid.
+    #[error(transparent)]
+    EnvFile(#[from] envfile::Error),
     /// The build directory does not read as modules.
     #[error(transparent)]
     Modules(#[from] modules::Error),
@@ -82,6 +117,14 @@ enum Error {
         profile: ProfileName,
         /// The call that failed.
         source: api::Error,
+    },
+    /// A poll of a profile failed.
+    #[error("profile {profile}: {source}")]
+    Poll {
+        /// The profile.
+        profile: ProfileName,
+        /// What failed.
+        source: poll::Failure,
     },
     /// The output is not writable.
     #[error("the output: {0}")]
@@ -106,9 +149,14 @@ fn main() -> ExitCode {
 fn run(cli: Cli, out: &mut dyn Write) -> Result<(), Error> {
     let config = Config::load(cli.config.as_deref())?;
     writeln!(out, "config {}", config.path.display())?;
+    let env = EnvFile::load(cli.env_file.as_deref())?;
+    if let Some(path) = &env.path {
+        writeln!(out, "env file {}: {} variables", path.display(), env.len())?;
+    }
     match cli.command {
-        Command::Upload(upload) => upload.run(&config, out),
+        Command::Upload(upload) => upload.run(&config, &env, out),
         Command::Profiles => profiles(&config, out),
+        Command::Poll(poll) => poll.run(&config, &env, out),
     }
 }
 
