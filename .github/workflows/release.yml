@@ -6,7 +6,7 @@ name: Release
 # artifacts, and only when the whole CI run is green (fmt, clippy, tests, and
 # the builds) this workflow downloads those artifacts and attaches them to a
 # release for the tag. That release is what
-# `mise use github:coconutbird/screepsmanager` installs from (see "Install"
+# `mise use github:openscreeps/screepsmanager` installs from (see "Install"
 # in README.md).
 #
 # Cutting a release: bump `[package].version` in Cargo.toml, run `cargo

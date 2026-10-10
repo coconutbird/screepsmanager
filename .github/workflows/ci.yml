@@ -130,7 +130,7 @@ jobs:
       # Signed SLSA provenance for the archive, recorded against this repo.
       # mise checks it through the GitHub attestations API by default when
       # installing from a release; `gh attestation verify <archive> --repo
-      # coconutbird/screepsmanager` does the same by hand. Tag builds only:
+      # openscreeps/screepsmanager` does the same by hand. Tag builds only:
       # dry runs are not release material.
       - name: Attest build provenance
         if: startsWith(github.ref, 'refs/tags/v')

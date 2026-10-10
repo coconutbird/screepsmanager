@@ -2,9 +2,11 @@
 name = "screepsmanager"
 description = "Uploads built Screeps code (JavaScript, source maps, WebAssembly) to the branches of Screeps servers through named profiles: the official server, seasonal servers, and private servers; and keeps a spawn of the account in the world."
 edition = "2024"
-version = "0.1.0"
+version = "0.2.0"
 publish = false
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/openscreeps/screepsmanager"
+readme = "README.md"
 rust-version = "1.99"
 
 # Keep this list short. Each entry needs a reason that std cannot meet.

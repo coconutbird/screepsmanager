@@ -1,0 +1,18 @@
+openapi.json is the official Screeps World HTTP contract of
+https://github.com/openscreeps/openapi, copied byte for byte from:
+
+  commit 1cf3725ab8df0b61028ae3177750217430abb818
+  path   openapi.json
+  blob   784aa003218a00d62b14f6bf46b8d375f6aabacb
+
+It is licensed under the ISC License in LICENSE (copied from the same
+commit, blob 021d06101034112c437098f09f6db141d345d406).
+
+The tests of src/api.rs check every request of the API client against it.
+To move to another commit of a checkout of openscreeps/openapi:
+
+  git -C OPENAPI show COMMIT:openapi.json > contract/openapi.json
+  git -C OPENAPI show COMMIT:LICENSE > contract/LICENSE
+  git hash-object contract/openapi.json contract/LICENSE
+
+and update the commit and the blobs here and in src/api.rs.
